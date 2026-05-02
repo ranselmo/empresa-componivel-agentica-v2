@@ -1,0 +1,289 @@
+version: "3.9"
+
+networks:
+  poc-network:
+    driver: bridge
+
+volumes:
+  db-pedidos-data:
+  db-estoque-data:
+  db-notificacoes-data:
+  kafka-data:
+  zookeeper-data:
+  prometheus-data:
+  grafana-data:
+
+services:
+
+  # ─── Zookeeper (required by Kafka) ─────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    networks:
+      - poc-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Kafka ─────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - poc-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ─── Kafka UI ──────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: poc-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - poc-network
+
+  # ─── API Gateway ───────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: api-gateway
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--accesslog=true"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - poc-network
+
+  # ─── Observability ─────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - poc-network
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: poc123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+    networks:
+      - poc-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - poc-network
+
+  # ─── Databases ─────────────────────────────────────────────────────
+  db-pedidos:
+    image: postgres:16-alpine
+    container_name: db-pedidos
+    environment:
+      POSTGRES_DB: pedidos
+      POSTGRES_USER: pedidos
+      POSTGRES_PASSWORD: pedidos123
+    ports:
+      - "5433:5432"
+    volumes:
+      - db-pedidos-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pedidos"]
+      interval: 5s
+      retries: 5
+    networks:
+      - poc-network
+
+  db-estoque:
+    image: postgres:16-alpine
+    container_name: db-estoque
+    environment:
+      POSTGRES_DB: estoque
+      POSTGRES_USER: estoque
+      POSTGRES_PASSWORD: estoque123
+    ports:
+      - "5434:5432"
+    volumes:
+      - db-estoque-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U estoque"]
+      interval: 5s
+      retries: 5
+    networks:
+      - poc-network
+
+  db-notificacoes:
+    image: postgres:16-alpine
+    container_name: db-notificacoes
+    environment:
+      POSTGRES_DB: notificacoes
+      POSTGRES_USER: notificacoes
+      POSTGRES_PASSWORD: notif123
+    ports:
+      - "5435:5432"
+    volumes:
+      - db-notificacoes-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notificacoes"]
+      interval: 5s
+      retries: 5
+    networks:
+      - poc-network
+
+  # ─── Cells ─────────────────────────────────────────────────────────
+  cell-pedidos:
+    build:
+      context: ./cell-pedidos
+      dockerfile: Dockerfile
+    container_name: cell-pedidos
+    environment:
+      DATABASE_URL: postgres://pedidos:pedidos123@db-pedidos:5432/pedidos?sslmode=disable
+      KAFKA_BROKERS: kafka:29092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: cell-pedidos
+      PORT: "8000"
+    depends_on:
+      db-pedidos:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pedidos.rule=PathPrefix(`/pedidos`)"
+      - "traefik.http.services.pedidos.loadbalancer.server.port=8000"
+    networks:
+      - poc-network
+    restart: unless-stopped
+
+  cell-estoque:
+    build:
+      context: ./cell-estoque
+      dockerfile: Dockerfile
+    container_name: cell-estoque
+    environment:
+      DATABASE_URL: postgres://estoque:estoque123@db-estoque:5432/estoque?sslmode=disable
+      KAFKA_BROKERS: kafka:29092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: cell-estoque
+      PORT: "8000"
+    depends_on:
+      db-estoque:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.estoque.rule=PathPrefix(`/estoque`)"
+      - "traefik.http.services.estoque.loadbalancer.server.port=8000"
+    networks:
+      - poc-network
+    restart: unless-stopped
+
+  cell-notificacoes:
+    build:
+      context: ./cell-notificacoes
+      dockerfile: Dockerfile
+    container_name: cell-notificacoes
+    environment:
+      DATABASE_URL: postgres://notificacoes:notif123@db-notificacoes:5432/notificacoes?sslmode=disable
+      KAFKA_BROKERS: kafka:29092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: cell-notificacoes
+      PORT: "8000"
+    depends_on:
+      db-notificacoes:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.notificacoes.rule=PathPrefix(`/notificacoes`)"
+      - "traefik.http.services.notificacoes.loadbalancer.server.port=8000"
+    networks:
+      - poc-network
+    restart: unless-stopped
+
+  # ─── AI Agent ──────────────────────────────────────────────────────
+  agent-mcp:
+    build:
+      context: ./agent-mcp
+      dockerfile: Dockerfile
+    container_name: agent-mcp
+    environment:
+      CELL_PEDIDOS_URL: http://cell-pedidos:8000
+      CELL_ESTOQUE_URL: http://cell-estoque:8000
+      CELL_NOTIFICACOES_URL: http://cell-notificacoes:8000
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PROMETHEUS_URL: http://prometheus:9090
+      PORT: "9000"
+    depends_on:
+      - cell-pedidos
+      - cell-estoque
+      - cell-notificacoes
+    ports:
+      - "9000:9000"
+    networks:
+      - poc-network
+    restart: unless-stopped

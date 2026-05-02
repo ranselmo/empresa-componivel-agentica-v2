@@ -1,0 +1,148 @@
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
+)
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func New(ctx context.Context) (*Store, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://pedidos:pedidos123@localhost:5433/pedidos?sslmode=disable"
+	}
+
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	config.MaxConns = 10
+	config.MinConns = 2
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+
+	return &Store{pool: pool}, nil
+}
+
+func (s *Store) Migrate(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS pedidos (
+			id            UUID PRIMARY KEY,
+			cliente_id    UUID NOT NULL,
+			status        TEXT NOT NULL DEFAULT 'PENDENTE',
+			valor_total   NUMERIC(12,2) NOT NULL,
+			itens         JSONB NOT NULL,
+			criado_em     TIMESTAMPTZ NOT NULL,
+			atualizado_em TIMESTAMPTZ NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_pedidos_cliente ON pedidos(cliente_id);
+		CREATE INDEX IF NOT EXISTS idx_pedidos_status  ON pedidos(status);
+	`)
+	return err
+}
+
+type itemJSON struct {
+	ProdutoID  string  `json:"produto_id"`
+	Quantidade int     `json:"quantidade"`
+	PrecoUnit  float64 `json:"preco_unitario"`
+}
+
+func (s *Store) Salvar(ctx context.Context, p *domain.Pedido) error {
+	itens := make([]itemJSON, len(p.Itens))
+	for i, it := range p.Itens {
+		itens[i] = itemJSON{ProdutoID: it.ProdutoID.String(), Quantidade: it.Quantidade, PrecoUnit: it.PrecoUnit}
+	}
+	itensJSON, _ := json.Marshal(itens)
+
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO pedidos (id, cliente_id, status, valor_total, itens, criado_em, atualizado_em)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (id) DO UPDATE SET
+			status = EXCLUDED.status,
+			valor_total = EXCLUDED.valor_total,
+			atualizado_em = EXCLUDED.atualizado_em
+	`, p.ID, p.ClienteID, string(p.Status), p.ValorTotal(), itensJSON, p.CriadoEm, p.AtualizadoEm)
+	return err
+}
+
+func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT id, cliente_id, status, itens, criado_em, atualizado_em FROM pedidos WHERE id=$1`, id)
+
+	var (
+		pid, cid     uuid.UUID
+		status       string
+		itensRaw     []byte
+		criadoEm, atualizadoEm time.Time
+	)
+	if err := row.Scan(&pid, &cid, &status, &itensRaw, &criadoEm, &atualizadoEm); err != nil {
+		return nil, err
+	}
+
+	var raw []itemJSON
+	json.Unmarshal(itensRaw, &raw)
+	itens := make([]domain.ItemPedido, len(raw))
+	for i, r := range raw {
+		uid, _ := uuid.Parse(r.ProdutoID)
+		itens[i] = domain.ItemPedido{ProdutoID: uid, Quantidade: r.Quantidade, PrecoUnit: r.PrecoUnit}
+	}
+
+	return &domain.Pedido{
+		ID: pid, ClienteID: cid,
+		Status: domain.StatusPedido(status),
+		Itens: itens, CriadoEm: criadoEm, AtualizadoEm: atualizadoEm,
+	}, nil
+}
+
+func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, cliente_id, status, itens, criado_em, atualizado_em
+		 FROM pedidos ORDER BY criado_em DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pedidos []*domain.Pedido
+	for rows.Next() {
+		var pid, cid uuid.UUID
+		var status string
+		var itensRaw []byte
+		var criadoEm, atualizadoEm time.Time
+		if err := rows.Scan(&pid, &cid, &status, &itensRaw, &criadoEm, &atualizadoEm); err != nil {
+			continue
+		}
+		var raw []itemJSON
+		json.Unmarshal(itensRaw, &raw)
+		itens := make([]domain.ItemPedido, len(raw))
+		for i, r := range raw {
+			uid, _ := uuid.Parse(r.ProdutoID)
+			itens[i] = domain.ItemPedido{ProdutoID: uid, Quantidade: r.Quantidade, PrecoUnit: r.PrecoUnit}
+		}
+		pedidos = append(pedidos, &domain.Pedido{
+			ID: pid, ClienteID: cid,
+			Status: domain.StatusPedido(status),
+			Itens: itens, CriadoEm: criadoEm, AtualizadoEm: atualizadoEm,
+		})
+	}
+	return pedidos, nil
+}
+
+func (s *Store) Close() { s.pool.Close() }

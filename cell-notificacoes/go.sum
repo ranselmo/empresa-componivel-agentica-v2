@@ -1,0 +1,4 @@
+// Este arquivo é gerado automaticamente pelo Go toolchain.
+// Execute: cd cell-pedidos && go mod tidy
+// Ou use: make deps
+// O arquivo go.sum real será gerado no primeiro build Docker (multi-stage).
