@@ -4,148 +4,108 @@ Implementação prática do framework de 4 pilares descrito no artigo
 **"Como Construir uma Empresa Componível Inteligente"** — Rafael Sá Anselmo.
 
 Esta é a **versão 2** da PoC, com stack tecnológica alternativa:  
-células escritas em **Go**, comunicação via **Apache Kafka**.
+células escritas em **Go**, comunicação via **Apache Kafka**, arquitetura de shards com SAGA Hub centralizado.
+
+---
+
+## Arquitetura
+
+```
+                          ┌─────────────────────────────────────────────────────┐
+ X-Client-ID header       │                   shard-router                      │
+ ──────────────────────►  │  hash(clienteID) % 3  →  shard-1 | shard-2 | shard-3│
+                          └──────────────┬──────────────────────────────────────┘
+                                         │
+                          ┌──────────────▼──────────────┐
+                          │          saga-hub            │
+                          │  único integrador entre PBCs │
+                          │  SAGA PedidoCriar + compensação│
+                          └──────┬────────┬────────┬─────┘
+                                 │        │        │
+                          ┌──────▼──┐ ┌───▼───┐ ┌─▼──────────────┐
+                          │ cell-   │ │cell-  │ │cell-           │
+                          │ pedidos │ │estoque│ │notificacoes    │
+                          │active/  │ │active/│ │active/passive  │
+                          │passive  │ │passive│ └────────────────┘
+                          └─────────┘ └───────┘
+                                 ↕ CDC via Debezium
+                          ┌─────────────────────┐
+                          │      data-sync       │
+                          │  ativo → passivo     │
+                          └─────────────────────┘
+```
+
+**Leis arquiteturais:**
+- **L1** — PBCs são ilhas: zero imports/HTTP calls diretos entre células
+- **L2** — `saga-hub` é o único integrador entre PBCs
+- **L3** — Toda requisição entra pelo `shard-router`
+- **L4** — Células passivas recusam escrita (HTTP 503)
+- **L5** — Scale Unit = 1 célula + 1 DB + 1 Redis + 1 consumer group Kafka
 
 ---
 
 ## Stack Tecnológica
 
-Esta seção explica cada tecnologia escolhida, sua função específica na solução e por que foi selecionada para esta PoC.
-
-### Linguagem das células: Go 1.22
-
-**O que é:** Go é uma linguagem compilada, estaticamente tipada, desenvolvida pelo Google, com foco em performance, simplicidade e concorrência nativa.
-
-**Por que na PoC:** As células de negócio (`cell-pedidos`, `cell-estoque`, `cell-notificacoes`) são implementadas em Go por três razões alinhadas ao framework. Primeira: o binário compilado resulta em imagens Docker de apenas ~15MB contra ~300MB do Python, o que acelera o deploy — diretamente ligado ao princípio de deployment de baixo risco do Pilar 1. Segunda: o modelo de concorrência de Go (goroutines + channels) permite que cada célula rode o consumer Kafka e o servidor HTTP no mesmo processo sem bloqueio, sem a complexidade do `asyncio`. Terceira: a tipagem estática funciona como uma fitness function em tempo de compilação — o build falha se um evento de domínio tiver campo faltando ou tipo errado, antes mesmo de rodar qualquer teste.
-
-**Onde aparece:** `cell-pedidos/`, `cell-estoque/`, `cell-notificacoes/` — todo código `.go`.
-
----
-
-### Event Bus: Apache Kafka 7.6 (Confluent)
-
-**O que é:** Kafka é uma plataforma distribuída de streaming de eventos, projetada para alta vazão, durabilidade e replay de mensagens. Diferente de filas tradicionais, os eventos ficam persistidos no log por um período configurável, e múltiplos consumidores podem ler de forma independente.
-
-**Por que na PoC:** O Kafka substitui o RabbitMQ da v1 e reforça dois princípios do framework de forma mais explícita. O princípio de isolamento de célula fica mais nítido porque cada célula tem seu próprio consumer group, lê em seu próprio ritmo e não bloqueia outras células se ficar lenta. O princípio de resiliência fica mais robusto porque, se uma célula cai e volta, ela recomeça do offset onde parou — nenhum evento é perdido, ao contrário de filas que podem descartar mensagens expiradas. Os tópicos (`dominio.pedido.criado`, `dominio.estoque.reservado`, etc.) formam o contrato de evento de domínio entre células, tornando o SAGA explícito e auditável.
-
-**Onde aparece:** `docker-compose.yml` (serviços `zookeeper` e `kafka`), `infra/messaging/kafka.go` em cada célula, Kafka UI em `localhost:8090`.
-
----
-
-### Driver Kafka em Go: confluent-kafka-go v2
-
-**O que é:** Biblioteca oficial da Confluent para Go, wrapper do `librdkafka` — a implementação C de alto desempenho do protocolo Kafka.
-
-**Por que na PoC:** É a opção de menor latência e maior compatibilidade com o ecossistema Confluent. O `CGO_ENABLED=1` no Dockerfile é necessário por isso — o driver linka com `librdkafka` via cgo. A troca de performance vale: o produtor com `acks=all` garante que nenhum evento de domínio é perdido em falha de broker.
-
-**Onde aparece:** `go.mod` de cada célula, `infra/messaging/kafka.go`.
+| Tecnologia | Versão | Papel na solução |
+|---|---|---|
+| Go | 1.22 | Linguagem das células e componentes de infraestrutura |
+| Apache Kafka | 7.6 (Confluent) | Event Bus para comandos, replies e eventos de domínio |
+| confluent-kafka-go | v2.3 | Driver Kafka para Go (alta performance, CGO) |
+| PostgreSQL | 16 | Banco isolado por célula (boundary físico) |
+| pgx | v5 | Driver Go nativo para PostgreSQL |
+| Gin | v1.10 | Framework HTTP das células Go |
+| Traefik | v3.0 | API Gateway — entry point único |
+| OpenTelemetry | v1.24 | Tracing distribuído entre células |
+| Jaeger | 1.52 | Backend de tracing distribuído |
+| Prometheus | 2.48 | Coleta de métricas de cada célula |
+| Grafana | 10.2 | Dashboards de métricas |
+| Python + httpx | 3.12 | Fitness functions no CI/CD |
+| GitHub Actions | — | Pipeline CI/CD com FFs integradas |
+| Anthropic Claude API | claude-sonnet-4-6 | LLM do agente autônomo |
+| Anthropic SDK Python | 0.28+ | Function calling / MCP tools |
+| FastAPI | 0.111 | Interface HTTP do agente |
+| scikit-learn | — | Anomaly detection (IsolationForest — F5) |
+| Kafka UI | latest | Inspeção visual de eventos Kafka |
+| Docker Compose | v2 | Orquestração local da PoC |
+| Kubernetes | 1.29+ | Manifests para deploy em produção (F2) |
 
 ---
 
-### Framework HTTP das células: Gin v1.10
+## Componentes
 
-**O que é:** Gin é o framework web mais utilizado em Go. Oferece roteamento de alta performance baseado em radix tree, middlewares componíveis e binding/validação de JSON via struct tags.
+### shard-router
+Recebe todas as requisições externas. Aplica consistent hashing sobre o header `X-Client-ID` (`sha256(clienteID) % 3`) para rotear para shard-1, shard-2 ou shard-3. Mantém um registry de células ativas/passivas por shard e implementa circuit breaker de roteamento.
 
-**Por que na PoC:** As APIs públicas das células (os contratos de PBC) são expostas via Gin. A integração com OpenTelemetry via `otelgin.Middleware` adiciona rastreamento automático a cada request sem modificar os handlers — isso implementa o conceito de observabilidade embutida da Engenharia de Plataforma (Pilar 2) sem poluir a lógica de negócio.
+### saga-hub
+Único integrador entre PBCs. Orquestra a SAGA `PedidoCriar` via padrão Async Request-Reply sobre Kafka:
+1. `commands.pedidos.criar` → cell-pedidos
+2. `commands.estoque.reservar` → cell-estoque
+3. `commands.notificacoes.enviar` → cell-notificacoes
 
-**Onde aparece:** `api/handlers.go` (cell-pedidos), `cmd/main.go` (cell-estoque, cell-notificacoes).
+Inclui compensação automática: falha no estoque → `commands.pedidos.cancelar` + notificação ao cliente.
 
----
+### data-sync
+Consome eventos CDC do Debezium (tópicos `cdc.*`) e aplica as mudanças da célula ativa para a célula passiva de cada shard. Garante que o passive node está sempre pronto para assumir.
 
-### Banco de dados das células: PostgreSQL 16 + pgx v5
+### cell-pedidos / cell-estoque / cell-notificacoes
+PBCs Go + Gin + Kafka + PostgreSQL. Cada um implementa o padrão Async Request-Reply: consome `commands.*`, processa, publica em `replies.*`. DLQ implementada para mensagens que falham após N retries.
 
-**O que é:** PostgreSQL é o banco relacional open-source mais avançado disponível. `pgx` é o driver Go nativo de mais alta performance para PostgreSQL, com suporte a pool de conexões, prepared statements e tipos PostgreSQL avançados (JSONB, UUID, TIMESTAMPTZ).
-
-**Por que na PoC:** Cada célula tem seu próprio banco PostgreSQL isolado — banco de pedidos, banco de estoque, banco de notificações — em portas diferentes (5433, 5434, 5435). Isso implementa fisicamente o boundary context do Pilar 1: não existe forma de uma célula acessar os dados de outra além de chamar sua API pública. O campo `itens` dos pedidos usa JSONB para armazenar a lista de itens sem precisar de tabela separada, mantendo o schema simples para a PoC.
-
-**Onde aparece:** `infra/db/store.go` em cada célula, serviços `db-pedidos`, `db-estoque`, `db-notificacoes` no `docker-compose.yml`.
-
----
-
-### API Gateway: Traefik v3
-
-**O que é:** Traefik é um reverse proxy e API gateway moderno, com discovery automático via Docker labels. Ao contrário do Nginx, não requer reload de configuração — detecta novos containers automaticamente.
-
-**Por que na PoC:** Implementa o entry point único para todas as células (Pilar 2 — Engenharia de Plataforma). O roteamento é feito por prefixo de path: `/pedidos` vai para `cell-pedidos`, `/estoque` vai para `cell-estoque`. As células não precisam saber umas das outras — só o gateway sabe o mapa de rotas. Traefik também expõe métricas Prometheus nativamente, sem configuração extra.
-
-**Onde aparece:** Serviço `traefik` no `docker-compose.yml`, labels `traefik.*` em cada célula, dashboard em `localhost:8080`.
+### agent-mcp
+Agente Python + Anthropic SDK + FastAPI que expõe capacidades das células como MCP tools. Inclui:
+- Loop de monitoramento autônomo (a cada 60s)
+- Detecção de anomalias via IsolationForest sobre métricas Prometheus (`anomaly/detector.py`)
+- Predictive scaling baseado em histórico (`scaling/predictor.py`)
 
 ---
 
-### Observabilidade — Distributed Tracing: OpenTelemetry + Jaeger
+## Tópicos Kafka
 
-**O que é:** OpenTelemetry (OTel) é o padrão aberto de observabilidade, agnóstico de vendor, que unifica traces, métricas e logs. Jaeger é um backend de tracing distribuído open-source, originalmente desenvolvido pelo Uber.
-
-**Por que na PoC:** Quando um `POST /pedidos` entra no sistema, ele percorre múltiplas células via eventos Kafka. Sem tracing distribuído, é impossível saber onde um pedido travou ou qual célula está lenta. O `otelgin.Middleware` no Gin propaga automaticamente o `trace_id` entre serviços via HTTP headers, e o exporter OTLP envia os spans para o Jaeger. Isso implementa a camada de observabilidade do Building Block descrito no Pilar 1 — toda célula vem com observabilidade embutida.
-
-**Onde aparece:** `setupOTel()` em cada `cmd/main.go`, exporter OTLP para `jaeger:4317`, UI em `localhost:16686`.
-
----
-
-### Observabilidade — Métricas: Prometheus + Grafana
-
-**O que é:** Prometheus é o sistema de coleta de métricas pull-based mais utilizado no ecossistema cloud-native. Grafana é a plataforma de dashboards que consome as métricas do Prometheus.
-
-**Por que na PoC:** Cada célula Go expõe um endpoint `/metrics` com contadores de requests HTTP, latências por percentil e uso de goroutines — automaticamente, via `prometheus/client_golang`. O Prometheus scrapa esses endpoints a cada 15 segundos. As fitness functions de latência (FF3) consultam o Prometheus via API para validar se o p99 dos endpoints está dentro do limite de 200ms. Isso fecha o ciclo do Pilar 3: a fitness function usa métricas reais de produção, não simuladas.
-
-**Onde aparece:** Serviços `prometheus` e `grafana` no `docker-compose.yml`, endpoint `/metrics` em cada célula, configuração em `infra/monitoring/prometheus.yml`.
-
----
-
-### Agente de IA: Python 3.12 + Anthropic SDK + FastAPI
-
-**O que é:** O agente MCP é o único componente em Python na v2. Usa o SDK oficial da Anthropic para Python, que implementa o loop de function calling (tools) para agentes autônomos. FastAPI expõe a interface HTTP do agente.
-
-**Por que Python aqui, e não Go:** O SDK da Anthropic com suporte completo a streaming, function calling e multi-turn conversations tem implementação de referência em Python. Reescrever em Go adicionaria complexidade sem benefício para a PoC. Isso ilustra um ponto importante do framework: células são políglotas — cada uma usa a linguagem mais adequada ao seu propósito. O agente acessa as células Go via HTTP, completamente agnóstico à linguagem delas.
-
-**Por que na PoC:** Implementa o Pilar 4 completo. O agente expõe as capacidades das células Go como ferramentas MCP (`criar_pedido`, `consultar_estoque`, `verificar_saude_sistema`, etc.) e as oferece ao Claude como contexto. O loop de monitoramento autônomo chama `verificar_saude_sistema()` a cada 60 segundos e raciocina sobre o resultado sem intervenção humana — demonstrando a "Célula Inteligente" do framework.
-
-**Onde aparece:** `agent-mcp/main.py`, serviço `agent-mcp` no `docker-compose.yml`, UI em `localhost:9000/docs`.
-
----
-
-### Fitness Functions: Python 3.12 + httpx
-
-**O que é:** Scripts Python que executam verificações automatizadas da arquitetura. `httpx` é uma biblioteca HTTP assíncrona para Python, com interface similar ao `requests`.
-
-**Por que Python para as FFs:** As fitness functions são ferramentas de CI/CD, não de produção. Python permite escrever verificações expressivas em poucas linhas, sem necessidade de compilar. A FF1 analisa o código-fonte Go com manipulação de strings simples. A FF2/FF3 disparam requests HTTP contra as células Go. A FF4 executa subprocessos `docker stop/start`. Python é a melhor ferramenta para esse tipo de script de automação.
-
-**Onde aparece:** `fitness-functions/run_all.py`, `.github/workflows/fitness-functions.yml`.
-
----
-
-### Kafka UI: Provectus Kafka UI
-
-**O que é:** Interface web open-source para inspecionar clusters Kafka — tópicos, partições, consumer groups, offsets e mensagens individuais.
-
-**Por que na PoC:** Torna os eventos de domínio visíveis durante a demo. É possível abrir o Kafka UI em `localhost:8090`, navegar até o tópico `dominio.pedido.criado`, clicar em uma mensagem e ver exatamente o JSON do evento `PedidoCriado` que a célula de Pedidos publicou. Isso torna o fluxo SAGA observável e didático — essencial para validar o Pilar 1 visualmente.
-
-**Onde aparece:** Serviço `kafka-ui` no `docker-compose.yml`, UI em `localhost:8090`.
-
----
-
-### Tabela resumo da stack
-
-| Tecnologia | Versão | Papel na solução | Pilar |
-|---|---|---|---|
-| Go | 1.22 | Linguagem das células de negócio | 1 |
-| Apache Kafka | 7.6 (Confluent) | Event Bus para SAGA inter-célula | 1 |
-| confluent-kafka-go | v2.3 | Driver Kafka para Go (alta performance) | 1 |
-| PostgreSQL | 16 | Banco isolado por célula (boundary físico) | 1 |
-| pgx | v5.5 | Driver Go nativo para PostgreSQL | 1 |
-| Gin | v1.10 | Framework HTTP das células Go | 2 |
-| Traefik | v3.0 | API Gateway — entry point único | 2 |
-| OpenTelemetry | v1.24 | Tracing distribuído entre células | 2 |
-| Jaeger | 1.52 | Backend de tracing distribuído | 2 |
-| Prometheus | 2.48 | Coleta de métricas de cada célula | 2 |
-| Grafana | 10.2 | Dashboards de métricas | 2 |
-| Python + httpx | 3.12 | Fitness functions no CI/CD | 3 |
-| GitHub Actions | — | Pipeline CI/CD com FFs integradas | 3 |
-| Anthropic Claude API | claude-sonnet-4-6 | LLM do agente autônomo | 4 |
-| Anthropic SDK Python | 0.28 | Function calling / MCP tools | 4 |
-| FastAPI | 0.111 | Interface HTTP do agente | 4 |
-| Kafka UI | latest | Inspeção visual de eventos Kafka | — |
-| Docker Compose | v2 | Orquestração local da PoC | — |
+| Padrão | Exemplo | Direção |
+|---|---|---|
+| `commands.{pbc}.{acao}` | `commands.pedidos.criar` | saga-hub → célula |
+| `replies.{pbc}.{acao}` | `replies.pedidos.criar` | célula → saga-hub |
+| `events.{pbc}.{tipo}` | `events.pedidos.confirmado` | célula → consumidores |
+| `cdc.*` | `cdc.pedidos.public.pedidos` | Debezium → data-sync |
 
 ---
 
@@ -158,10 +118,11 @@ Esta seção explica cada tecnologia escolhida, sua função específica na solu
 | Tamanho da imagem Docker | ~300MB por célula | ~15MB por célula |
 | Modelo de concorrência | asyncio (cooperative) | goroutines (preemptive) |
 | Replay de eventos | Não (fila descarta) | Sim (log retido 24h) |
-| Visibilidade de eventos | RabbitMQ Management UI | Kafka UI |
-| Consumer groups | Subscriptions por fila | Consumer groups por tópico |
+| Roteamento | Sem shards | Shard Router (consistent hashing) |
+| SAGA | Coreografia implícita | Orquestração explícita (saga-hub) |
+| Replicação de dados | Não | Data Sync via CDC (Debezium) |
+| Deploy em produção | Docker Compose apenas | Kubernetes manifests completos |
 | Tipagem de eventos | Pydantic (runtime) | Structs Go (compile-time) |
-| Agente de IA | Python (SDK nativo) | Python (SDK nativo) |
 
 ---
 
@@ -208,9 +169,10 @@ curl http://localhost/notificacoes/health
 ### SAGA — Pedido com estoque disponível
 
 ```bash
-# Criar pedido (Notebook Pro — 10 unidades)
+# Criar pedido roteado para o shard do cliente
 curl -X POST http://localhost/pedidos/ \
   -H "Content-Type: application/json" \
+  -H "X-Client-ID: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" \
   -d '{
     "cliente_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     "itens": [{
@@ -227,12 +189,32 @@ sleep 5
 curl http://localhost/pedidos/{pedido_id}
 ```
 
-### Visualizar eventos Kafka
+### SAGA — Pedido sem estoque (compensação)
 
-1. Acesse http://localhost:8090
-2. Clique em **Topics**
-3. Navegue pelos tópicos `dominio.pedido.*` e `dominio.estoque.*`
-4. Clique em **Messages** para ver os eventos publicados em tempo real
+```bash
+# produto 44444444 tem estoque 0 → dispara compensação
+curl -X POST http://localhost/pedidos/ \
+  -H "Content-Type: application/json" \
+  -H "X-Client-ID: bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" \
+  -d '{
+    "cliente_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "itens": [{
+      "produto_id": "44444444-4444-4444-4444-444444444444",
+      "quantidade": 1,
+      "preco_unitario": 3499.90
+    }]
+  }'
+
+# Status final deve ser CANCELADO com notificação enviada
+sleep 5
+curl http://localhost/pedidos/{pedido_id}
+```
+
+### Demo automatizada
+
+```bash
+bash demo.sh
+```
 
 ### Fitness Functions
 
@@ -256,6 +238,8 @@ curl -X POST http://localhost:9000/agente/executar \
 | Interface | URL | Credenciais |
 |---|---|---|
 | API Gateway (Traefik) | http://localhost:8080 | — |
+| Shard Router | http://localhost:8000 | — |
+| Saga Hub API | http://localhost:8100/docs | — |
 | Swagger cell-pedidos | http://localhost/pedidos/docs | — |
 | Swagger cell-estoque | http://localhost/estoque/docs | — |
 | Kafka UI | http://localhost:8090 | — |
@@ -280,40 +264,78 @@ curl -X POST http://localhost:9000/agente/executar \
 ## Estrutura do repositório
 
 ```
-poc-eci-go/
-├── cell-pedidos/
-│   ├── domain/
-│   │   ├── pedido.go       # Entidade + regras de negócio (Go puro)
-│   │   └── events.go       # Contratos de eventos (structs tipadas)
-│   ├── infra/
-│   │   ├── db/store.go     # PostgreSQL com pgx
-│   │   └── messaging/kafka.go  # Producer + Consumer Kafka
-│   ├── api/handlers.go     # Gin HTTP handlers
-│   ├── cmd/main.go         # Wire-up + OTel + Prometheus
-│   ├── go.mod
-│   └── Dockerfile          # Multi-stage build Go
+empresa-componivel-agentica-v2/
 │
-├── cell-estoque/           # Mesma estrutura
-├── cell-notificacoes/      # cmd/main.go único (célula mais simples)
+├── shard-router/               # F0: consistent hashing + registry de shards
+│   ├── domain/routing.go       # sha256(clienteID) % 3
+│   ├── infra/registry.go       # registry de células ativas/passivas
+│   ├── infra/watcher.go        # health-check contínuo das células
+│   ├── api/handlers.go
+│   └── cmd/main.go
+│
+├── saga-hub/                   # F0: orquestrador de SAGAs
+│   ├── domain/saga.go          # estados: pending → completed | failed | compensating
+│   ├── orchestrator/pedido.go  # SAGA PedidoCriar com compensação
+│   ├── infra/db/store.go       # persistência de estado da SAGA
+│   ├── infra/messaging/        # producer + consumer Kafka
+│   └── cmd/main.go
+│
+├── data-sync/                  # F0: CDC ativo → passivo via Debezium
+│   ├── infra/applier.go
+│   └── cmd/main.go
+│
+├── cell-pedidos/               # PBC de pedidos
+│   ├── domain/
+│   │   ├── pedido.go
+│   │   └── events.go
+│   ├── infra/
+│   │   ├── db/store.go
+│   │   ├── db/query_store.go   # CQRS read model
+│   │   ├── messaging/kafka.go
+│   │   ├── messaging/producer.go
+│   │   └── messaging/dlq.go    # Dead Letter Queue
+│   ├── api/handlers.go
+│   └── cmd/main.go
+│
+├── cell-estoque/               # PBC de estoque (mesma estrutura)
+├── cell-notificacoes/          # PBC de notificações (mesma estrutura)
 │
 ├── agent-mcp/
-│   ├── main.py             # Python + Anthropic SDK + FastAPI
-│   ├── requirements.txt
-│   └── Dockerfile
+│   ├── main.py                 # FastAPI + Anthropic SDK + MCP tools
+│   ├── anomaly/detector.py     # F5: IsolationForest sobre métricas Prometheus
+│   ├── scaling/predictor.py    # F5: predictive scaling
+│   └── requirements.txt
 │
-├── fitness-functions/
-│   └── run_all.py          # FF1 (Go static), FF2, FF3, FF4
+├── k8s/
+│   ├── base/namespace.yaml
+│   ├── core/
+│   │   ├── shard-router.yaml
+│   │   └── saga-hub.yaml
+│   └── shards/
+│       ├── shard-1/{cell}-active/  deployment.yaml + hpa.yaml (×3 células)
+│       ├── shard-2/                (mesma estrutura)
+│       └── shard-3/                (mesma estrutura)
+│
+├── runbooks/
+│   ├── circuit-breaker.md
+│   ├── data-sync-lag.md
+│   └── shard-failover.md
 │
 ├── infra/monitoring/
 │   ├── prometheus.yml
-│   └── grafana-datasources.yml
+│   ├── grafana-datasources.yml
+│   └── grafana-dashboards.yml
+│
+├── fitness-functions/
+│   └── run_all.py
 │
 ├── .github/workflows/
-│   └── fitness-functions.yml
+│   └── fitness-functions.yml   # CI: executa FFs a cada push
 │
 ├── docker-compose.yml
-├── .env.example
-└── README.md
+├── Makefile
+├── demo.sh
+└── PROMPT.md                   # Master Prompt v3 — especificação arquitetural completa
 ```
 
 ---
@@ -337,8 +359,15 @@ docker exec kafka kafka-consumer-groups \
 docker exec -it db-pedidos psql -U pedidos -d pedidos \
   -c "SELECT id, status, valor_total FROM pedidos ORDER BY criado_em DESC;"
 
+# Ver estado das SAGAs
+docker exec -it db-saga psql -U saga -d saga \
+  -c "SELECT id, status, current_step, created_at FROM sagas ORDER BY created_at DESC;"
+
 # Rebuild de uma célula Go após mudança
 docker compose build cell-pedidos && docker compose restart cell-pedidos
+
+# Executar fitness functions localmente
+make fitness-check
 
 # Limpar tudo
 docker compose down -v
@@ -346,4 +375,71 @@ docker compose down -v
 
 ---
 
-*PoC v2 — Go + Kafka — baseada no artigo "Como Construir uma Empresa Componível Inteligente" — Rafael Sá Anselmo (2025)*
+## Status de implementação por fase
+
+| Fase | Descrição | Status |
+|---|---|---|
+| F0 — Fundação | shard-router, saga-hub, data-sync, PBCs Async Request-Reply | ✅ Completo |
+| F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | 🟡 Parcial (DLQ implementada) |
+| F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | 🟡 Parcial (k8s + CQRS) |
+| F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ⬜ Pendente |
+| F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks | 🟡 Parcial (Runbooks) |
+| F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | 🟡 Parcial (anomaly + scaling) |
+
+---
+
+## Changelog
+
+### v2.1.0 — 2026-05-03
+
+**Arquitetura de shards e SAGA Hub (F0)**
+
+- Adicionado `shard-router`: consistent hashing via `sha256(X-Client-ID) % 3`, registry de células ativas/passivas com health-check contínuo
+- Adicionado `saga-hub`: orquestrador de SAGAs com padrão Async Request-Reply via Kafka, persistência de estado em PostgreSQL, compensação automática (reserva falha → cancelar pedido + notificar cliente), métricas Prometheus (`saga_started_total`, `saga_completed_total`, `saga_duration_seconds`)
+- Adicionado `data-sync`: consumer CDC Debezium para replicação ativo→passivo por shard
+
+**PBCs refatorados para Async Request-Reply**
+
+- `cell-pedidos`, `cell-estoque`, `cell-notificacoes`: migrados de comunicação síncrona para consumo de `commands.*` e publicação em `replies.*`
+- Dead Letter Queue (DLQ) implementada em todas as células (`infra/messaging/dlq.go`)
+- CQRS read model adicionado em `cell-pedidos` e `cell-estoque` (`infra/db/query_store.go`)
+
+**Kubernetes (F2 parcial)**
+
+- Manifests completos para deploy em produção: `k8s/base/namespace.yaml`, `k8s/core/shard-router.yaml`, `k8s/core/saga-hub.yaml`
+- Deployments e HPAs para todos os shards (shard-1/2/3) com active/passive por célula (18 deployments total)
+
+**IA Avançada (F5 parcial)**
+
+- `agent-mcp/anomaly/detector.py`: detecção de anomalias com `IsolationForest` sobre métricas Prometheus (`shard_router_requests_total`, `data_sync_lag_seconds`, `saga_duration_seconds`, `circuit_breaker_state`)
+- `agent-mcp/scaling/predictor.py`: predictive scaling baseado em histórico de métricas
+- `agent-mcp/main.py` expandido com novas MCP tools para consulta de SAGAs e shards
+
+**SRE e Observabilidade (F4 parcial)**
+
+- Runbooks operacionais: `runbooks/circuit-breaker.md`, `runbooks/data-sync-lag.md`, `runbooks/shard-failover.md`
+- `infra/monitoring/prometheus.yml` e dashboards Grafana atualizados com métricas de saga-hub e shard-router
+- CI pipeline `fitness-functions.yml` adicionado ao GitHub Actions (executa a cada push em `main`)
+
+**Infraestrutura**
+
+- `docker-compose.yml` expandido com serviços `shard-router`, `saga-hub`, `data-sync`, databases dedicados por componente
+- `demo.sh` expandido com cenários de demonstração para todos os novos componentes
+- `Makefile` atualizado com targets `fitness-check`, `k8s-apply`, `build-all`
+- `PROMPT.md` (Master Prompt v3, 79KB): especificação arquitetural completa adicionada ao repositório
+
+---
+
+### v2.0.0 — 2026-05-02
+
+**Release inicial**
+
+- `cell-pedidos`, `cell-estoque`, `cell-notificacoes`: PBCs em Go 1.22 + Gin + Kafka + PostgreSQL
+- `agent-mcp`: agente Python + Anthropic SDK + FastAPI com loop de monitoramento autônomo
+- `fitness-functions/run_all.py`: FF1 (isolamento Go static), FF2 (health), FF3 (latência p99), FF4 (resiliência)
+- `docker-compose.yml`: Traefik, Kafka, Prometheus, Grafana, Jaeger, Kafka UI
+- `demo.sh`: script de demonstração manual da SAGA
+
+---
+
+*PoC v2 — Go + Kafka — baseada no artigo "Como Construir uma Empresa Componível Inteligente" — Rafael Sá Anselmo (2026)*
