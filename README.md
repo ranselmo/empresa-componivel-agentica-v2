@@ -429,6 +429,7 @@ make fitness-check
 
 - `docker-compose.yml` expandido com serviços `shard-router`, `saga-hub`, `data-sync`, databases dedicados por componente
 - `demo.sh` expandido com cenários de demonstração para todos os novos componentes
+- `teardown.sh`: script de limpeza completa — para e remove containers, volumes, rede `poc-eci` e cache Python; flag `--images` remove também as imagens buildadas
 - `Makefile` atualizado com targets `fitness-check`, `k8s-apply`, `build-all`
 - `PROMPT.md` (Master Prompt v3, 79KB): especificação arquitetural completa adicionada ao repositório
 
