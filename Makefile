@@ -21,12 +21,12 @@ build: ## Build local das células (sem Docker)
 	@echo "✓ Build concluído"
 
 up: ## Sobe o stack completo
-	docker compose up -d
-	@echo "Aguardando serviços... (60s para Kafka)"
-	@sleep 60
-	@curl -sf http://localhost/pedidos/health && echo " ✓ pedidos" || echo " ✗ pedidos"
-	@curl -sf http://localhost/estoque/health && echo " ✓ estoque" || echo " ✗ estoque"
-	@curl -sf http://localhost/notificacoes/health && echo " ✓ notificacoes" || echo " ✗ notificacoes"
+	docker compose up -d --build
+	@echo "Aguardando shard-router ficar saudável..."
+	@until curl -sf http://localhost:8080/healthz/live >/dev/null 2>&1; do sleep 2; done
+	@curl -sf http://localhost:8080/healthz/live && echo " ✓ shard-router OK"
+	@curl -sf http://localhost:8080/router/cells | python3 -c \
+	  "import sys,json; c=json.load(sys.stdin).get('cells',[]); print(f' ✓ {sum(1 for x in c if x[\"Healthy\"])}/{len(c)} células saudáveis')"
 
 down: ## Para e remove todos os containers e volumes
 	docker compose down -v
@@ -50,11 +50,11 @@ rebuild: ## Rebuild e restart de uma célula específica (ex: make rebuild CELL=
 	docker compose build $(CELL) && docker compose restart $(CELL)
 
 kafka-topics: ## Lista os tópicos Kafka criados
-	docker exec kafka kafka-topics --bootstrap-server localhost:9092 --list
+	docker compose exec kafka kafka-topics --bootstrap-server kafka:29092 --list
 
 kafka-lag: ## Mostra o consumer lag de todos os grupos
-	docker exec kafka kafka-consumer-groups \
-		--bootstrap-server localhost:9092 \
+	docker compose exec kafka kafka-consumer-groups \
+		--bootstrap-server kafka:29092 \
 		--describe --all-groups 2>/dev/null || echo "Nenhum grupo ativo ainda"
 
 clean: ## Remove binários e caches

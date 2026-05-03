@@ -24,6 +24,10 @@ import (
 )
 
 func setupOTel(ctx context.Context) func() {
+	svcName := os.Getenv("OTEL_SERVICE_NAME")
+	if svcName == "" {
+		svcName = "cell-pedidos"
+	}
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		endpoint = "http://jaeger:4317"
@@ -40,11 +44,11 @@ func setupOTel(ctx context.Context) func() {
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName("cell-pedidos"),
+			semconv.ServiceName(svcName),
 		)),
 	)
 	otel.SetTracerProvider(tp)
-	return func() { tp.Shutdown(ctx) }
+	return func() { _ = tp.Shutdown(context.Background()) }
 }
 
 func main() {
@@ -55,7 +59,9 @@ func main() {
 	shutdown := setupOTel(ctx)
 	defer shutdown()
 
-	// Database
+	shardID := os.Getenv("SHARD_ID")
+	cellRole := os.Getenv("CELL_ROLE")
+
 	store, err := db.New(ctx)
 	if err != nil {
 		slog.Error("db connect", "err", err)
@@ -67,7 +73,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Kafka producer
 	prod, err := messaging.NewProducer()
 	if err != nil {
 		slog.Error("kafka producer", "err", err)
@@ -75,24 +80,50 @@ func main() {
 	}
 	defer prod.Close()
 
-	// Kafka consumer (goroutine)
-	cons, err := messaging.NewConsumer(store, prod)
+	h := api.NewHandler(store, prod)
+
+	cons, err := messaging.NewConsumer(h, prod)
 	if err != nil {
 		slog.Error("kafka consumer", "err", err)
 		os.Exit(1)
 	}
 	go cons.Run(ctx)
 
-	// HTTP server
 	r := gin.New()
 	r.Use(gin.Recovery(), otelgin.Middleware("cell-pedidos"))
+	r.Use(func(c *gin.Context) {
+		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(reqCtx)
+		c.Next()
+	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "cell": "pedidos"})
+
+	r.GET("/healthz/live", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok", "shard": shardID, "role": cellRole})
+	})
+	r.GET("/healthz/ready", func(c *gin.Context) {
+		if err := store.Ping(c.Request.Context()); err != nil {
+			c.JSON(503, gin.H{"status": "db unhealthy", "error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"status": "ok", "shard": shardID, "role": cellRole})
 	})
 
-	h := api.NewHandler(store, prod)
-	h.RegisterRoutes(r)
+	if cellRole == "passive" {
+		for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+			r.Handle(method, "/*path", func(c *gin.Context) {
+				c.JSON(503, gin.H{
+					"error":     "cell is passive — writes forbidden",
+					"cell_role": "passive",
+					"shard_id":  shardID,
+				})
+			})
+		}
+		slog.Info("passive cell — write routes blocked", "shard", shardID)
+	} else {
+		h.RegisterRoutes(r)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -101,7 +132,7 @@ func main() {
 
 	srv := &http.Server{Addr: fmt.Sprintf(":%s", port), Handler: r}
 	go func() {
-		slog.Info("cell-pedidos listening", "port", port)
+		slog.Info("cell-pedidos listening", "port", port, "shard", shardID, "role", cellRole)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "err", err)
 		}
@@ -112,8 +143,8 @@ func main() {
 	<-sig
 
 	slog.Info("shutting down")
+	cancel()
 	ctx2, c2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer c2()
-	srv.Shutdown(ctx2)
-	cancel()
+	_ = srv.Shutdown(ctx2)
 }

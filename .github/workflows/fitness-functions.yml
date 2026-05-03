@@ -1,0 +1,67 @@
+name: Fitness Functions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check PBC isolation (L1)
+        run: |
+          for pbc in cell-pedidos cell-estoque cell-notificacoes; do
+            others=""
+            for other in cell-pedidos cell-estoque cell-notificacoes; do
+              [ "$pbc" = "$other" ] && continue
+              others="$others $other"
+            done
+            for other in $others; do
+              if grep -r "ranselmo/poc-eci/$other" $pbc/; then
+                echo "FAIL: $pbc imports $other (L1 violation)"
+                exit 1
+              fi
+            done
+          done
+          echo "PASS: all PBC boundaries respected"
+
+  sast:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cell:
+          - shard-router
+          - saga-hub
+          - data-sync
+          - cell-pedidos
+          - cell-estoque
+          - cell-notificacoes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - name: govulncheck
+        run: cd ${{ matrix.cell }} && go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+      - name: gosec
+        run: cd ${{ matrix.cell }} && go install github.com/securego/gosec/v2/cmd/gosec@latest && gosec -severity medium ./...
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cell:
+          - shard-router
+          - saga-hub
+          - data-sync
+          - cell-pedidos
+          - cell-estoque
+          - cell-notificacoes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - name: build
+        run: cd ${{ matrix.cell }} && go build ./...

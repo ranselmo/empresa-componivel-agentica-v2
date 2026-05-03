@@ -145,4 +145,5 @@ func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error)
 	return pedidos, nil
 }
 
-func (s *Store) Close() { s.pool.Close() }
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+func (s *Store) Close()                         { s.pool.Close() }

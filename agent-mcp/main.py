@@ -3,7 +3,7 @@ Agente MCP — Pilar 4: Célula Inteligente
 Stack: Python + Anthropic SDK (SDK nativo para agentes de IA)
 Células Go são acessadas via HTTP — agnóstico à linguagem.
 """
-import asyncio, os, json, logging, httpx
+import asyncio, os, json, logging, subprocess, httpx
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -18,8 +18,92 @@ CELL_ESTOQUE_URL      = os.getenv("CELL_ESTOQUE_URL",      "http://cell-estoque:
 CELL_NOTIFICACOES_URL = os.getenv("CELL_NOTIFICACOES_URL", "http://cell-notificacoes:8000")
 PROMETHEUS_URL        = os.getenv("PROMETHEUS_URL",        "http://prometheus:9090")
 ANTHROPIC_API_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
+SHARD_ROUTER_URL      = os.getenv("SHARD_ROUTER_URL",     "http://shard-router:8080")
+SAGA_HUB_URL          = os.getenv("SAGA_HUB_URL",         "http://saga-hub:9090")
 
 client_ai = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# F5.1 — Shard-aware tools
+SHARD_TOOLS = [
+    {
+        "name": "listar_status_shards",
+        "description": "Lista saúde de todas as células de todos os shards via /router/cells",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "verificar_saga",
+        "description": "Consulta status de uma saga específica",
+        "input_schema": {
+            "type": "object",
+            "properties": {"saga_id": {"type": "string"}},
+            "required": ["saga_id"]
+        }
+    },
+    {
+        "name": "iniciar_saga_pedido",
+        "description": "Inicia uma saga de pedido via saga-hub",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cliente_id": {"type": "string"},
+                "shard_id":   {"type": "string"},
+                "payload":    {"type": "object"}
+            },
+            "required": ["cliente_id", "shard_id", "payload"]
+        }
+    },
+    {
+        "name": "reiniciar_celula",
+        "description": "Reinicia célula específica via docker restart (apenas local/dev)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "container_name": {"type": "string"},
+                "motivo":         {"type": "string"}
+            },
+            "required": ["container_name", "motivo"]
+        }
+    },
+    {
+        "name": "consultar_prometheus",
+        "description": "Executa query PromQL e retorna resultados",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }
+    }
+]
+
+
+async def executar_shard_tool(name: str, inputs: dict) -> str:
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        try:
+            if name == "listar_status_shards":
+                r = await http.get(f"{SHARD_ROUTER_URL}/router/cells")
+                return json.dumps(r.json(), ensure_ascii=False)
+            elif name == "verificar_saga":
+                r = await http.get(f"{SAGA_HUB_URL}/saga/{inputs['saga_id']}")
+                return json.dumps(r.json(), ensure_ascii=False)
+            elif name == "iniciar_saga_pedido":
+                r = await http.post(f"{SAGA_HUB_URL}/saga/pedido", json=inputs)
+                return json.dumps(r.json(), ensure_ascii=False)
+            elif name == "reiniciar_celula":
+                result = subprocess.run(
+                    ["docker", "restart", inputs["container_name"]],
+                    capture_output=True, text=True, timeout=30
+                )
+                return json.dumps({"stdout": result.stdout, "stderr": result.stderr,
+                                   "returncode": result.returncode})
+            elif name == "consultar_prometheus":
+                r = await http.get(f"{PROMETHEUS_URL}/api/v1/query",
+                    params={"query": inputs["query"]})
+                data = r.json().get("data", {}).get("result", [])
+                return json.dumps(data, ensure_ascii=False)
+            return f"unknown tool: {name}"
+        except Exception as e:
+            return f"Erro ao executar {name}: {e}"
+
 
 MCP_TOOLS = [
     {
@@ -90,6 +174,9 @@ MCP_TOOLS = [
 
 
 async def executar_tool(name: str, inputs: dict) -> str:
+    shard_tool_names = {t["name"] for t in SHARD_TOOLS}
+    if name in shard_tool_names:
+        return await executar_shard_tool(name, inputs)
     async with httpx.AsyncClient(timeout=10.0) as http:
         try:
             if name == "criar_pedido":
@@ -240,6 +327,22 @@ async def ver_log():
 @app.get("/agente/tools")
 async def listar_tools():
     return {"tools": [{"name": t["name"], "description": t["description"]} for t in MCP_TOOLS]}
+
+
+@app.get("/agente/anomalias")
+async def anomalias():
+    from anomaly.detector import detector
+    result = await detector.run_once()
+    return result
+
+
+@app.get("/agente/scaling/previsao")
+async def scaling_previsao():
+    from scaling.predictor import predictors
+    results = []
+    for pred in predictors.values():
+        results.append(await pred.predict())
+    return {"previsoes": results}
 
 
 @app.get("/health")

@@ -3,31 +3,36 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: prometheus
+  - job_name: shard-router
     static_configs:
-      - targets: ["localhost:9090"]
+      - targets: ['shard-router:8080']
+    metrics_path: /metrics
+
+  - job_name: saga-hub
+    static_configs:
+      - targets: ['saga-hub:9090']
+    metrics_path: /metrics
 
   - job_name: cell-pedidos
     static_configs:
-      - targets: ["cell-pedidos:8000"]
+      - targets:
+          - 'cell-pedidos-s1-active:8000'
+          - 'cell-pedidos-s2-active:8000'
+          - 'cell-pedidos-s3-active:8000'
     metrics_path: /metrics
 
   - job_name: cell-estoque
     static_configs:
-      - targets: ["cell-estoque:8000"]
+      - targets:
+          - 'cell-estoque-s1-active:8000'
+          - 'cell-estoque-s2-active:8000'
+          - 'cell-estoque-s3-active:8000'
     metrics_path: /metrics
 
   - job_name: cell-notificacoes
     static_configs:
-      - targets: ["cell-notificacoes:8000"]
-    metrics_path: /metrics
-
-  - job_name: agent-mcp
-    static_configs:
-      - targets: ["agent-mcp:9000"]
-    metrics_path: /metrics
-
-  - job_name: traefik
-    static_configs:
-      - targets: ["api-gateway:8080"]
+      - targets:
+          - 'cell-notif-s1-active:8000'
+          - 'cell-notif-s2-active:8000'
+          - 'cell-notif-s3-active:8000'
     metrics_path: /metrics

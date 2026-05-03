@@ -24,6 +24,10 @@ import (
 )
 
 func setupOTel(ctx context.Context) func() {
+	svcName := os.Getenv("OTEL_SERVICE_NAME")
+	if svcName == "" {
+		svcName = "cell-estoque"
+	}
 	ep := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if ep == "" {
 		ep = "http://jaeger:4317"
@@ -34,10 +38,81 @@ func setupOTel(ctx context.Context) func() {
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName("cell-estoque"))),
+		sdktrace.WithResource(resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(svcName))),
 	)
 	otel.SetTracerProvider(tp)
-	return func() { tp.Shutdown(ctx) }
+	return func() { _ = tp.Shutdown(context.Background()) }
+}
+
+// estoqueProcessor implementa messaging.CommandProcessor
+type estoqueProcessor struct{ store *db.Store }
+
+func (ep *estoqueProcessor) ProcessCommand(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
+	switch cmd.CommandType {
+	case "reservar_estoque":
+		return ep.reservar(ctx, cmd)
+	case "liberar_estoque":
+		return ep.liberar(ctx, cmd)
+	default:
+		return messaging.Reply{}, fmt.Errorf("unknown command: %s", cmd.CommandType)
+	}
+}
+
+func (ep *estoqueProcessor) reservar(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
+	itensRaw, _ := cmd.Payload["itens"].([]any)
+	if len(itensRaw) == 0 {
+		return failReply(cmd, messaging.TopicReplyInsuficiente, "itens required"), nil
+	}
+	for _, ir := range itensRaw {
+		im, _ := ir.(map[string]any)
+		prodID, err := uuid.Parse(fmt.Sprintf("%v", im["produto_id"]))
+		if err != nil {
+			return failReply(cmd, messaging.TopicReplyInsuficiente, "invalid produto_id"), nil
+		}
+		qty := toInt(im["quantidade"])
+
+		prod, err := ep.store.BuscarPorID(ctx, prodID)
+		if err != nil {
+			return failReply(cmd, messaging.TopicReplyInsuficiente,
+				fmt.Sprintf("produto %s não encontrado", prodID)), nil
+		}
+		if !prod.Reservar(qty) {
+			return failReply(cmd, messaging.TopicReplyInsuficiente,
+				fmt.Sprintf("estoque insuficiente produto %s: disponivel=%d solicitado=%d",
+					prodID, prod.QuantidadeDisponivel, qty)), nil
+		}
+		if err := ep.store.Salvar(ctx, prod); err != nil {
+			return messaging.Reply{}, fmt.Errorf("salvar produto: %w", err)
+		}
+	}
+	return messaging.Reply{
+		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
+		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
+		Status: "success", RepliedAt: time.Now().UTC(),
+	}, nil
+}
+
+func (ep *estoqueProcessor) liberar(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
+	return messaging.Reply{
+		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
+		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
+		Status: "success", RepliedAt: time.Now().UTC(),
+	}, nil
+}
+
+func failReply(cmd messaging.Command, _ string, reason string) messaging.Reply {
+	return messaging.Reply{
+		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
+		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
+		Status: "failure", Error: reason, RepliedAt: time.Now().UTC(),
+	}
+}
+
+func toInt(v any) int {
+	if n, ok := v.(float64); ok {
+		return int(n)
+	}
+	return 0
 }
 
 func main() {
@@ -47,18 +122,29 @@ func main() {
 
 	defer setupOTel(ctx)()
 
+	shardID := os.Getenv("SHARD_ID")
+	cellRole := os.Getenv("CELL_ROLE")
+
 	store, err := db.New(ctx)
 	if err != nil {
 		slog.Error("db connect", "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
-	store.Migrate(ctx)
+	if err := store.Migrate(ctx); err != nil {
+		slog.Error("migrate", "err", err)
+		os.Exit(1)
+	}
 
-	prod, _ := messaging.NewProducer()
+	prod, err := messaging.NewProducer()
+	if err != nil {
+		slog.Error("kafka producer", "err", err)
+		os.Exit(1)
+	}
 	defer prod.Close()
 
-	cons, err := messaging.NewConsumer(store, prod)
+	proc := &estoqueProcessor{store: store}
+	cons, err := messaging.NewConsumer(proc, prod)
 	if err != nil {
 		slog.Error("kafka consumer", "err", err)
 		os.Exit(1)
@@ -67,74 +153,101 @@ func main() {
 
 	r := gin.New()
 	r.Use(gin.Recovery(), otelgin.Middleware("cell-estoque"))
+	r.Use(func(c *gin.Context) {
+		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(reqCtx)
+		c.Next()
+	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok", "cell": "estoque"})
+	r.GET("/healthz/live", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok", "shard": shardID, "role": cellRole})
 	})
-
-	estoque := r.Group("/estoque")
-
-	estoque.GET("/", func(c *gin.Context) {
-		produtos, err := store.Listar(c.Request.Context())
-		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+	r.GET("/healthz/ready", func(c *gin.Context) {
+		if err := store.Ping(c.Request.Context()); err != nil {
+			c.JSON(503, gin.H{"status": "db unhealthy", "error": err.Error()})
 			return
 		}
-		result := make([]gin.H, len(produtos))
-		for i, p := range produtos {
-			result[i] = gin.H{
+		c.JSON(200, gin.H{"status": "ok", "shard": shardID, "role": cellRole})
+	})
+
+	if cellRole == "passive" {
+		for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+			r.Handle(method, "/*path", func(c *gin.Context) {
+				c.JSON(503, gin.H{
+					"error":     "cell is passive — writes forbidden",
+					"cell_role": "passive",
+					"shard_id":  shardID,
+				})
+			})
+		}
+		slog.Info("passive cell — write routes blocked", "shard", shardID)
+	} else {
+		estoque := r.Group("/estoque")
+		estoque.GET("/stats", func(c *gin.Context) {
+			st, err := store.Stats(c.Request.Context())
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(200, st)
+		})
+		estoque.GET("/", func(c *gin.Context) {
+			produtos, err := store.Listar(c.Request.Context())
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			result := make([]gin.H, len(produtos))
+			for i, p := range produtos {
+				result[i] = gin.H{
+					"id": p.ID, "nome": p.Nome,
+					"quantidade_disponivel": p.QuantidadeDisponivel,
+					"preco": p.Preco, "atualizado_em": p.AtualizadoEm,
+				}
+			}
+			c.JSON(200, result)
+		})
+		estoque.GET("/:id", func(c *gin.Context) {
+			id, err := uuid.Parse(c.Param("id"))
+			if err != nil {
+				c.JSON(400, gin.H{"error": "id inválido"})
+				return
+			}
+			p, err := store.BuscarPorID(c.Request.Context(), id)
+			if err != nil {
+				c.JSON(404, gin.H{"error": "produto não encontrado"})
+				return
+			}
+			c.JSON(200, gin.H{
 				"id": p.ID, "nome": p.Nome,
 				"quantidade_disponivel": p.QuantidadeDisponivel,
 				"preco": p.Preco, "atualizado_em": p.AtualizadoEm,
+			})
+		})
+		estoque.PUT("/:id/repor", func(c *gin.Context) {
+			id, _ := uuid.Parse(c.Param("id"))
+			var req struct {
+				Quantidade int `json:"quantidade" binding:"required,min=1"`
 			}
-		}
-		c.JSON(200, result)
-	})
-
-	estoque.GET("/:id", func(c *gin.Context) {
-		id, err := uuid.Parse(c.Param("id"))
-		if err != nil {
-			c.JSON(400, gin.H{"error": "id inválido"})
-			return
-		}
-		p, err := store.BuscarPorID(c.Request.Context(), id)
-		if err != nil {
-			c.JSON(404, gin.H{"error": "produto não encontrado"})
-			return
-		}
-		c.JSON(200, gin.H{
-			"id": p.ID, "nome": p.Nome,
-			"quantidade_disponivel": p.QuantidadeDisponivel,
-			"preco": p.Preco, "atualizado_em": p.AtualizadoEm,
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(400, gin.H{"error": err.Error()})
+				return
+			}
+			p, err := store.BuscarPorID(c.Request.Context(), id)
+			if err != nil {
+				c.JSON(404, gin.H{"error": "produto não encontrado"})
+				return
+			}
+			_ = p.Repor(req.Quantidade)
+			_ = store.Salvar(c.Request.Context(), p)
+			c.JSON(200, gin.H{
+				"mensagem":              fmt.Sprintf("Estoque reposto. Novo total: %d", p.QuantidadeDisponivel),
+				"quantidade_disponivel": p.QuantidadeDisponivel,
+			})
 		})
-	})
-
-	estoque.PUT("/:id/repor", func(c *gin.Context) {
-		id, _ := uuid.Parse(c.Param("id"))
-		var req struct {
-			Quantidade int `json:"quantidade" binding:"required,min=1"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-		p, err := store.BuscarPorID(c.Request.Context(), id)
-		if err != nil {
-			c.JSON(404, gin.H{"error": "produto não encontrado"})
-			return
-		}
-		p.Repor(req.Quantidade)
-		store.Salvar(c.Request.Context(), p)
-		c.JSON(200, gin.H{
-			"mensagem":              fmt.Sprintf("Estoque reposto. Novo total: %d", p.QuantidadeDisponivel),
-			"quantidade_disponivel": p.QuantidadeDisponivel,
-		})
-	})
-
-	estoque.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok", "cell": "estoque", "version": "1.0.0"})
-	})
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -142,7 +255,7 @@ func main() {
 	}
 	srv := &http.Server{Addr: ":" + port, Handler: r}
 	go func() {
-		slog.Info("cell-estoque listening", "port", port)
+		slog.Info("cell-estoque listening", "port", port, "shard", shardID, "role", cellRole)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server", "err", err)
 		}
@@ -154,5 +267,5 @@ func main() {
 	cancel()
 	ctx2, c2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer c2()
-	srv.Shutdown(ctx2)
+	_ = srv.Shutdown(ctx2)
 }

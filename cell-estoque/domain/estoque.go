@@ -7,14 +7,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// ── Domain model ───────────────────────────────────────────────────
-
 type Produto struct {
-	ID                  uuid.UUID
-	Nome                string
+	ID                   uuid.UUID
+	Nome                 string
 	QuantidadeDisponivel int
-	Preco               float64
-	AtualizadoEm        time.Time
+	Preco                float64
+	AtualizadoEm         time.Time
 }
 
 func (p *Produto) Reservar(quantidade int) bool {
@@ -38,45 +36,8 @@ func (p *Produto) Repor(quantidade int) error {
 	return nil
 }
 
-// ── Tópicos Kafka ──────────────────────────────────────────────────
-
+// Tópicos democratizados publicados por este PBC
 const (
-	TopicPedidoCriado        = "dominio.pedido.criado"
-	TopicEstoqueReservado    = "dominio.estoque.reservado"
-	TopicEstoqueInsuficiente = "dominio.estoque.insuficiente"
+	TopicEventEstoqueReservado    = "events.estoque.reservado"
+	TopicEventEstoqueInsuficiente = "events.estoque.insuficiente"
 )
-
-// ── Eventos ────────────────────────────────────────────────────────
-
-type ItemEvento struct {
-	ProdutoID  uuid.UUID `json:"produto_id"`
-	Quantidade int       `json:"quantidade"`
-	PrecoUnit  float64   `json:"preco_unitario"`
-}
-
-type PedidoCriado struct {
-	EventID   uuid.UUID    `json:"event_id"`
-	EventType string       `json:"event_type"`
-	PedidoID  uuid.UUID    `json:"pedido_id"`
-	ClienteID uuid.UUID    `json:"cliente_id"`
-	Itens     []ItemEvento `json:"itens"`
-	Timestamp time.Time    `json:"timestamp"`
-}
-
-type EstoqueReservado struct {
-	EventID         uuid.UUID    `json:"event_id"`
-	EventType       string       `json:"event_type"`
-	PedidoID        uuid.UUID    `json:"pedido_id"`
-	ItensReservados []ItemEvento `json:"itens_reservados"`
-	Timestamp       time.Time    `json:"timestamp"`
-}
-
-type EstoqueInsuficiente struct {
-	EventID              uuid.UUID `json:"event_id"`
-	EventType            string    `json:"event_type"`
-	PedidoID             uuid.UUID `json:"pedido_id"`
-	ProdutoID            uuid.UUID `json:"produto_id"`
-	QuantidadeSolicitada int       `json:"quantidade_solicitada"`
-	QuantidadeDisponivel int       `json:"quantidade_disponivel"`
-	Timestamp            time.Time `json:"timestamp"`
-}
