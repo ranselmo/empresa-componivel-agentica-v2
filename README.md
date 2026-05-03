@@ -335,6 +335,7 @@ empresa-componivel-agentica-v2/
 ├── docker-compose.yml
 ├── Makefile
 ├── demo.sh
+├── teardown.sh                 # para e remove todos os recursos da demo
 └── PROMPT.md                   # Master Prompt v3 — especificação arquitetural completa
 ```
 
@@ -369,8 +370,11 @@ docker compose build cell-pedidos && docker compose restart cell-pedidos
 # Executar fitness functions localmente
 make fitness-check
 
-# Limpar tudo
-docker compose down -v
+# Parar demo e liberar todos os recursos (containers, volumes, rede, cache Python)
+./teardown.sh
+
+# Idem + remove imagens buildadas (~15MB × 7) para liberar disco completamente
+./teardown.sh --images
 ```
 
 ---
