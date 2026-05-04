@@ -347,7 +347,8 @@ empresa-componivel-agentica-v2/
 ├── Makefile
 ├── demo.sh
 ├── teardown.sh                 # para e remove todos os recursos da demo
-└── PROMPT.md                   # Master Prompt v3 — especificação arquitetural completa
+├── PROMPT.md                   # Master Prompt v3 — especificação arquitetural completa
+└── REFINE.md                   # SDD de refinamento — 47 melhorias identificadas em revisão de código
 ```
 
 ---
@@ -410,6 +411,27 @@ docker compose up -d && ./check.sh --full
 ---
 
 ## Changelog
+
+### v2.8.0 — 2026-05-04
+
+**Revisão de código completa + REFINE.md (SDD de refinamento)**
+
+- **Revisão de código:** varredura de todos os 120+ arquivos do repositório — Go, Python, YAML, shell scripts, Dockerfiles e manifests k8s. 47 melhorias identificadas e classificadas em 5 categorias de severidade.
+- **`REFINE.md`** adicionado: Software Design Document com plano de execução completo das 47 melhorias em 6 fases (`R1`–`R6`). Cada item especifica o problema, a solução com pseudocódigo e o critério de verificação. Inclui decisões de design globais (módulo `shared`, módulo `contract`, refatoração de cell-notificacoes), ordem de execução com árvore de dependências e critérios globais de aceitação com comandos bash executáveis.
+- **Correções pontuais** incluídas no mesmo commit: compatibilidade bash 3.2 no `check.sh` (substituição de associative array por `tmpfile+sort -u`, correção de prefixo/sufixo dos containers) e `cliente_id` adicionado ao payload do comando `criar_pedido` no `saga-hub/orchestrator/pedido.go`.
+
+**Melhorias identificadas por categoria:**
+
+| Categoria | Qtd | Exemplos |
+|---|---|---|
+| Bugs críticos e segurança | 9 | Reserva sem transação atômica, compensação não libera estoque, SQL injection no data-sync, at-most-once no Kafka |
+| Duplicação de código | 6 | `setupOTel` em 5 componentes, `resilience/` em 6 módulos, passive-mode em 3 cells |
+| Inconsistência arquitetural | 8 | cell-notificacoes god-file, estoqueProcessor inline, `CorrelationID == SagaID` |
+| Observabilidade e runtime | 10 | `ipLimiter` sem TTL, `ReverseProxy` por request, SLO de latência ausente, regras Prometheus não montadas |
+| CI/CD e infraestrutura | 15 | Sem cache de módulos, ferramentas `@latest`, Kafka com ZooKeeper, sem PDB, sem NetworkPolicy |
+| Testes | 3 | Zero `*_test.go`, `BOUNDARY_RULES` inócuo no FF1, FF2 sem JWT |
+
+---
 
 ### v2.7.0 — 2026-05-04
 
