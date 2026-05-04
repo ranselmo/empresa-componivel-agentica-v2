@@ -89,8 +89,9 @@ func (pr *Producer) PublishReply(topic string, reply Reply) error {
 	})
 }
 
-func (pr *Producer) Flush() { pr.p.Flush(5000) }
-func (pr *Producer) Close() { pr.p.Flush(5000); pr.p.Close() }
+func (pr *Producer) KafkaProducer() *kafka.Producer { return pr.p }
+func (pr *Producer) Flush()                         { pr.p.Flush(5000) }
+func (pr *Producer) Close()                         { pr.p.Flush(5000); pr.p.Close() }
 
 type Consumer struct {
 	c        *kafka.Consumer

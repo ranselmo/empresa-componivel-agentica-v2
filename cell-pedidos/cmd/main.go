@@ -13,8 +13,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ranselmo/poc-eci/cell-pedidos/api"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/audit"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/db"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/messaging"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -80,7 +82,8 @@ func main() {
 	}
 	defer prod.Close()
 
-	h := api.NewHandler(store, prod)
+	al := audit.New("cell-pedidos", shardID, prod.KafkaProducer())
+	h := api.NewHandler(store, prod, al)
 
 	cons, err := messaging.NewConsumer(h, prod)
 	if err != nil {
@@ -90,7 +93,7 @@ func main() {
 	go cons.Run(ctx)
 
 	r := gin.New()
-	r.Use(gin.Recovery(), otelgin.Middleware("cell-pedidos"))
+	r.Use(gin.Recovery(), otelgin.Middleware("cell-pedidos"), middleware.RateLimit())
 	r.Use(func(c *gin.Context) {
 		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()

@@ -13,8 +13,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/audit"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/auth"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/db"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/messaging"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -151,8 +154,11 @@ func main() {
 	}
 	go cons.Run(ctx)
 
+	al := audit.New("cell-estoque", shardID, prod.KafkaProducer())
+	jwtMW := auth.Middleware()
+
 	r := gin.New()
-	r.Use(gin.Recovery(), otelgin.Middleware("cell-estoque"))
+	r.Use(gin.Recovery(), otelgin.Middleware("cell-estoque"), middleware.RateLimit())
 	r.Use(func(c *gin.Context) {
 		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
@@ -226,7 +232,7 @@ func main() {
 				"preco": p.Preco, "atualizado_em": p.AtualizadoEm,
 			})
 		})
-		estoque.PUT("/:id/repor", func(c *gin.Context) {
+		estoque.PUT("/:id/repor", jwtMW, func(c *gin.Context) {
 			id, _ := uuid.Parse(c.Param("id"))
 			var req struct {
 				Quantidade int `json:"quantidade" binding:"required,min=1"`
@@ -242,6 +248,15 @@ func main() {
 			}
 			_ = p.Repor(req.Quantidade)
 			_ = store.Salvar(c.Request.Context(), p)
+
+			actorID, _ := c.Get("actor_id")
+			if actorID == nil {
+				actorID = "anonymous"
+			}
+			al.Log(c.Request.Context(), "repor_estoque", "produto", id.String(),
+				fmt.Sprintf("%v", actorID),
+				map[string]any{"quantidade": req.Quantidade, "novo_total": p.QuantidadeDisponivel})
+
 			c.JSON(200, gin.H{
 				"mensagem":              fmt.Sprintf("Estoque reposto. Novo total: %d", p.QuantidadeDisponivel),
 				"quantidade_disponivel": p.QuantidadeDisponivel,

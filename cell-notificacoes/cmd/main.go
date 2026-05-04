@@ -17,8 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/audit"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/cache"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/middleware"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/resilience"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
@@ -172,7 +174,7 @@ func publishReply(prod *kafka.Producer, reply Reply) {
 	}, nil)
 }
 
-func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer) {
+func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *audit.Logger) {
 	shardID := os.Getenv("SHARD_ID")
 	cellRole := os.Getenv("CELL_ROLE")
 
@@ -219,7 +221,7 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer) {
 			}
 
 			err = bh.Do(ctx, func() error {
-				return processCmd(ctx, store, prod, cmd)
+				return processCmd(ctx, store, prod, al, cmd)
 			})
 
 			if err != nil {
@@ -241,7 +243,7 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer) {
 	}
 }
 
-func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, cmd Command) error {
+func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, al *audit.Logger, cmd Command) error {
 	clienteIDStr := fmt.Sprintf("%v", cmd.Payload["cliente_id"])
 	destID, _ := uuid.Parse(clienteIDStr)
 	tipo, _ := cmd.Payload["tipo"].(string)
@@ -255,6 +257,8 @@ func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, cmd Com
 	slog.Info("enviando notificação", "tipo", tipo, "destinatario", destID)
 	if err := store.Salvar(ctx, notifID, destID, tipo, "email", conteudo); err != nil {
 		slog.Error("salvar notificacao", "err", err)
+		al.Log(ctx, "enviar_notificacao_falhou", "notificacao", notifID.String(),
+			clienteIDStr, map[string]any{"tipo": tipo, "erro": err.Error()})
 		publishReply(prod, Reply{
 			ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
 			SagaID: cmd.SagaID, CommandType: cmd.CommandType,
@@ -263,6 +267,8 @@ func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, cmd Com
 		return err
 	}
 
+	al.Log(ctx, "enviar_notificacao", "notificacao", notifID.String(),
+		clienteIDStr, map[string]any{"tipo": tipo, "canal": "email"})
 	publishReply(prod, Reply{
 		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
 		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
@@ -326,10 +332,12 @@ func main() {
 	}
 	defer func() { prod.Flush(5000); prod.Close() }()
 
-	go runConsumer(ctx, store, prod)
+	al := audit.New("cell-notificacoes", shardID, prod)
+
+	go runConsumer(ctx, store, prod, al)
 
 	r := gin.New()
-	r.Use(gin.Recovery(), otelgin.Middleware("cell-notificacoes"))
+	r.Use(gin.Recovery(), otelgin.Middleware("cell-notificacoes"), middleware.RateLimit())
 	r.Use(func(c *gin.Context) {
 		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()

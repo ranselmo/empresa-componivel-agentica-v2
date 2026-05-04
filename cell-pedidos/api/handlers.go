@@ -9,6 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/audit"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/auth"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/db"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/messaging"
 )
@@ -16,10 +18,11 @@ import (
 type Handler struct {
 	store *db.Store
 	prod  *messaging.Producer
+	audit *audit.Logger
 }
 
-func NewHandler(store *db.Store, prod *messaging.Producer) *Handler {
-	return &Handler{store: store, prod: prod}
+func NewHandler(store *db.Store, prod *messaging.Producer, al *audit.Logger) *Handler {
+	return &Handler{store: store, prod: prod, audit: al}
 }
 
 // ProcessCommand implementa messaging.CommandProcessor — recebe comandos do saga-hub via Kafka
@@ -113,11 +116,12 @@ type criarPedidoReq struct {
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	jwtMW := auth.Middleware()
 	g := r.Group("/pedidos")
-	g.POST("/", h.CriarPedido)
 	g.GET("/", h.ListarPedidos)
 	g.GET("/stats", h.Stats)
 	g.GET("/:id", h.BuscarPedido)
+	g.POST("/", jwtMW, h.CriarPedido)
 }
 
 func (h *Handler) Stats(c *gin.Context) {
@@ -162,6 +166,14 @@ func (h *Handler) CriarPedido(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "erro ao salvar pedido"})
 		return
 	}
+
+	actorID, _ := c.Get("actor_id")
+	if actorID == nil {
+		actorID = "anonymous"
+	}
+	h.audit.Log(c.Request.Context(), "criar_pedido", "pedido", pedido.ID.String(),
+		fmt.Sprintf("%v", actorID),
+		map[string]any{"cliente_id": req.ClienteID, "valor_total": pedido.ValorTotal()})
 
 	c.JSON(http.StatusCreated, gin.H{
 		"pedido_id":   pedido.ID,
