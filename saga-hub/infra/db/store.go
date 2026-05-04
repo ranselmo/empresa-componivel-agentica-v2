@@ -13,6 +13,7 @@ import (
 	"github.com/ranselmo/poc-eci/saga-hub/infra/resilience"
 )
 
+
 type SagaStore struct {
 	pool    *pgxpool.Pool
 	breaker *resilience.Breaker
@@ -20,9 +21,6 @@ type SagaStore struct {
 
 func NewSagaStore(ctx context.Context) (*SagaStore, error) {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://saga:saga123@db-saga:5432/saga?sslmode=disable"
-	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("db connect: %w", err)
@@ -111,5 +109,3 @@ func (s *SagaStore) FindByID(ctx context.Context, id uuid.UUID) (*domain.Saga, e
 
 func (s *SagaStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 func (s *SagaStore) Close()                         { s.pool.Close() }
-
-var _ = time.Now

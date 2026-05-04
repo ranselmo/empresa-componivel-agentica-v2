@@ -16,6 +16,34 @@ import (
 	"github.com/ranselmo/poc-eci/data-sync/infra/resilience"
 )
 
+var allowedTables = map[string]map[string]bool{
+	"pedidos": {
+		"id": true, "cliente_id": true, "status": true,
+		"valor_total": true, "itens": true, "criado_em": true, "atualizado_em": true,
+	},
+	"produtos": {
+		"id": true, "nome": true, "quantidade_disponivel": true,
+		"preco": true, "atualizado_em": true,
+	},
+	"notificacoes": {
+		"id": true, "destinatario_id": true, "tipo": true,
+		"canal": true, "conteudo": true, "enviado_em": true,
+	},
+}
+
+func isAllowedTable(table string) bool {
+	_, ok := allowedTables[table]
+	return ok
+}
+
+func isAllowedColumn(table, col string) bool {
+	cols, ok := allowedTables[table]
+	if !ok {
+		return false
+	}
+	return cols[col]
+}
+
 var (
 	applied = promauto.NewCounterVec(
 		prometheus.CounterOpts{Name: "data_sync_applied_total"},
@@ -49,10 +77,11 @@ func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
 	}
 
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  brokers,
-		"group.id":           "data-sync-cdc-group",
-		"auto.offset.reset":  "earliest",
-		"enable.auto.commit": "true",
+		"bootstrap.servers":        brokers,
+		"group.id":                 "data-sync-cdc-group",
+		"auto.offset.reset":        "earliest",
+		"enable.auto.commit":       "false",
+		"enable.auto.offset.store": "false",
 	})
 	if err != nil {
 		return nil, err
@@ -105,12 +134,16 @@ func (a *Applier) Run(ctx context.Context) {
 		default:
 			msg, err := a.c.ReadMessage(200)
 			if err != nil {
-				if !strings.Contains(strings.ToLower(err.Error()), "timed out") {
+				kafkaErr, ok := err.(kafka.Error)
+				if !ok || kafkaErr.Code() != kafka.ErrTimedOut {
 					slog.Error("read", "err", err)
 				}
 				continue
 			}
 			a.apply(ctx, msg)
+			if _, cErr := a.c.CommitMessage(msg); cErr != nil {
+				slog.Error("commit offset", "err", cErr)
+			}
 		}
 	}
 }
@@ -139,6 +172,10 @@ func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 	}
 
 	table := dm.Payload.Source.Table
+	if !isAllowedTable(table) {
+		slog.Warn("rejected table not in allowlist", "table", table)
+		return
+	}
 	var err error
 	switch dm.Payload.Op {
 	case "c", "r":
@@ -173,7 +210,10 @@ func applyInsert(ctx context.Context, pool *pgxpool.Pool, table string, row map[
 	if len(row) == 0 {
 		return nil
 	}
-	cols, vals, placeholders := insertParts(row)
+	cols, vals, placeholders := insertParts(table, row)
+	if cols == "" {
+		return nil
+	}
 	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (id) DO NOTHING",
 		table, cols, placeholders)
 	_, err := pool.Exec(ctx, q, vals...)
@@ -184,7 +224,7 @@ func applyUpdate(ctx context.Context, pool *pgxpool.Pool, table string, before, 
 	if len(after) == 0 || before["id"] == nil {
 		return nil
 	}
-	set, vals := setParts(after)
+	set, vals := setParts(table, after)
 	if set == "" {
 		return nil
 	}
@@ -201,10 +241,14 @@ func applyDelete(ctx context.Context, pool *pgxpool.Pool, table string, before m
 	return err
 }
 
-func insertParts(row map[string]any) (cols string, vals []any, placeholders string) {
+func insertParts(table string, row map[string]any) (cols string, vals []any, placeholders string) {
 	var cs, ps []string
 	i := 1
 	for k, v := range row {
+		if !isAllowedColumn(table, k) {
+			slog.Warn("rejected column not in allowlist", "table", table, "column", k)
+			continue
+		}
 		cs = append(cs, k)
 		vals = append(vals, v)
 		ps = append(ps, fmt.Sprintf("$%d", i))
@@ -213,12 +257,16 @@ func insertParts(row map[string]any) (cols string, vals []any, placeholders stri
 	return strings.Join(cs, ","), vals, strings.Join(ps, ",")
 }
 
-func setParts(row map[string]any) (string, []any) {
+func setParts(table string, row map[string]any) (string, []any) {
 	var parts []string
 	var vals []any
 	i := 1
 	for k, v := range row {
 		if k == "id" {
+			continue
+		}
+		if !isAllowedColumn(table, k) {
+			slog.Warn("rejected column not in allowlist", "table", table, "column", k)
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s=$%d", k, i))

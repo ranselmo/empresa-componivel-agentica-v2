@@ -72,6 +72,8 @@ func (o *PedidoSaga) HandleReply(ctx context.Context, reply domain.Reply) error 
 		return o.onNotificacaoReply(ctx, saga, reply)
 	case "cancelar_pedido":
 		return o.onPedidoCancelado(ctx, saga, reply)
+	case "liberar_estoque":
+		return o.onEstoqueLiberado(ctx, saga, reply)
 	default:
 		return fmt.Errorf("unknown command_type: %s", reply.CommandType)
 	}
@@ -92,7 +94,9 @@ func (o *PedidoSaga) onPedidoCriado(ctx context.Context, saga *domain.Saga, repl
 	}
 	saga.CurrentStep = domain.StepReservarEstoque
 	saga.UpdatedAt = time.Now().UTC()
-	_ = o.store.Save(ctx, saga)
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
 	return o.prod.PublishCommand(domain.TopicCmdEstoqueReservar,
 		o.newCmd(saga, "reservar_estoque", saga.Payload))
 }
@@ -102,13 +106,17 @@ func (o *PedidoSaga) onEstoqueReply(ctx context.Context, saga *domain.Saga, repl
 		saga.Status = domain.StatusCompensating
 		saga.CurrentStep = domain.StepCompensarPedido
 		saga.UpdatedAt = time.Now().UTC()
-		_ = o.store.Save(ctx, saga)
+		if err := o.store.Save(ctx, saga); err != nil {
+			slog.Error("save saga", "saga_id", saga.ID, "err", err)
+		}
 		return o.prod.PublishCommand(domain.TopicCmdPedidoCancelar,
 			o.newCmd(saga, "cancelar_pedido", map[string]any{"motivo": reply.Error}))
 	}
 	saga.CurrentStep = domain.StepEnviarNotificacao
 	saga.UpdatedAt = time.Now().UTC()
-	_ = o.store.Save(ctx, saga)
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
 	return o.prod.PublishCommand(domain.TopicCmdNotificacaoEnviar,
 		o.newCmd(saga, "enviar_notificacao", map[string]any{
 			"cliente_id": saga.ClienteID.String(),
@@ -120,7 +128,9 @@ func (o *PedidoSaga) onEstoqueReply(ctx context.Context, saga *domain.Saga, repl
 func (o *PedidoSaga) onNotificacaoReply(ctx context.Context, saga *domain.Saga, reply domain.Reply) error {
 	saga.Status = domain.StatusCompleted
 	saga.UpdatedAt = time.Now().UTC()
-	_ = o.store.Save(ctx, saga)
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
 	sagaDone.WithLabelValues("pedido", "success").Inc()
 	sagaDur.WithLabelValues("pedido").Observe(time.Since(saga.CreatedAt).Seconds())
 	o.prod.PublishBusinessEvent(domain.TopicEventPedidoConfirmado, domain.BusinessEvent{
@@ -132,19 +142,33 @@ func (o *PedidoSaga) onNotificacaoReply(ctx context.Context, saga *domain.Saga, 
 }
 
 func (o *PedidoSaga) onPedidoCancelado(ctx context.Context, saga *domain.Saga, _ domain.Reply) error {
+	saga.CurrentStep = domain.StepLiberarEstoque
+	saga.UpdatedAt = time.Now().UTC()
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
+	return o.prod.PublishCommand(domain.TopicCmdEstoqueLiberar,
+		o.newCmd(saga, "liberar_estoque", saga.Payload))
+}
+
+func (o *PedidoSaga) onEstoqueLiberado(ctx context.Context, saga *domain.Saga, _ domain.Reply) error {
 	saga.Status = domain.StatusFailed
 	saga.UpdatedAt = time.Now().UTC()
-	_ = o.store.Save(ctx, saga)
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
 	sagaDone.WithLabelValues("pedido", "compensated").Inc()
 	o.prod.PublishBusinessEvent(domain.TopicEventPedidoCancelado, domain.BusinessEvent{
 		EventID: uuid.New(), EventType: "PedidoCancelado",
 		ShardID: saga.ShardID, OccurredAt: time.Now().UTC(), Payload: saga.Payload,
 	})
-	_ = o.prod.PublishCommand(domain.TopicCmdNotificacaoEnviar,
+	if err := o.prod.PublishCommand(domain.TopicCmdNotificacaoEnviar,
 		o.newCmd(saga, "enviar_notificacao", map[string]any{
 			"cliente_id": saga.ClienteID.String(),
 			"tipo":       "PEDIDO_CANCELADO",
-		}))
+		})); err != nil {
+		slog.Error("publish notificacao cancelado", "saga_id", saga.ID, "err", err)
+	}
 	slog.Warn("saga compensated", "saga_id", saga.ID)
 	return nil
 }
@@ -152,8 +176,15 @@ func (o *PedidoSaga) onPedidoCancelado(ctx context.Context, saga *domain.Saga, _
 func (o *PedidoSaga) failSaga(ctx context.Context, saga *domain.Saga, reason string) error {
 	saga.Status = domain.StatusFailed
 	saga.UpdatedAt = time.Now().UTC()
-	_ = o.store.Save(ctx, saga)
+	if err := o.store.Save(ctx, saga); err != nil {
+		slog.Error("save saga", "saga_id", saga.ID, "err", err)
+	}
 	sagaDone.WithLabelValues("pedido", "failed").Inc()
+	o.prod.PublishBusinessEvent(domain.TopicEventPedidoFalhou, domain.BusinessEvent{
+		EventID: uuid.New(), EventType: "PedidoFalhou",
+		ShardID: saga.ShardID, OccurredAt: time.Now().UTC(),
+		Payload: map[string]any{"saga_id": saga.ID, "reason": reason},
+	})
 	slog.Error("saga failed", "saga_id", saga.ID, "reason", reason)
 	return nil
 }

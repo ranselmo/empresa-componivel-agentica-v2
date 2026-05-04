@@ -25,10 +25,6 @@ type Store struct {
 
 func New(ctx context.Context) (*Store, error) {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://pedidos:pedidos123@localhost:5433/pedidos?sslmode=disable"
-	}
-
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
@@ -134,7 +130,9 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, 
 	}
 
 	var raw []itemJSON
-	json.Unmarshal(itensRaw, &raw)
+	if err := json.Unmarshal(itensRaw, &raw); err != nil {
+		return nil, fmt.Errorf("unmarshal itens: %w", err)
+	}
 	itens := make([]domain.ItemPedido, len(raw))
 	for i, r := range raw {
 		uid, _ := uuid.Parse(r.ProdutoID)
@@ -170,7 +168,9 @@ func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error)
 			continue
 		}
 		var raw []itemJSON
-		json.Unmarshal(itensRaw, &raw)
+		if err := json.Unmarshal(itensRaw, &raw); err != nil {
+			slog.Warn("unmarshal itens", "err", err)
+		}
 		itens := make([]domain.ItemPedido, len(raw))
 		for i, r := range raw {
 			uid, _ := uuid.Parse(r.ProdutoID)

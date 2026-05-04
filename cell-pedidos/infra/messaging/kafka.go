@@ -52,10 +52,11 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 	groupID := fmt.Sprintf("cell-pedidos-%s-%s-cmd", shardID, cellRole)
 
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  brokers,
-		"group.id":           groupID,
-		"auto.offset.reset":  "earliest",
-		"enable.auto.commit": "true",
+		"bootstrap.servers":        brokers,
+		"group.id":                 groupID,
+		"auto.offset.reset":        "earliest",
+		"enable.auto.commit":       "false",
+		"enable.auto.offset.store": "false",
 	})
 	if err != nil {
 		return nil, err
@@ -72,12 +73,16 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 	}, nil
 }
 
+func offsetKey(msg *kafka.Message) string {
+	return fmt.Sprintf("%d:%d", msg.TopicPartition.Partition, msg.TopicPartition.Offset)
+}
+
 func (cs *Consumer) Run(ctx context.Context) {
 	if cs.c == nil {
 		<-ctx.Done()
 		return
 	}
-	failCount := 0
+	failCounts := make(map[string]int)
 	for {
 		select {
 		case <-ctx.Done():
@@ -86,7 +91,8 @@ func (cs *Consumer) Run(ctx context.Context) {
 		default:
 			msg, err := cs.c.ReadMessage(200)
 			if err != nil {
-				if !strings.Contains(strings.ToLower(err.Error()), "timed out") {
+				kafkaErr, ok := err.(kafka.Error)
+				if !ok || kafkaErr.Code() != kafka.ErrTimedOut {
 					slog.Error("kafka read", "err", err)
 				}
 				continue
@@ -94,6 +100,9 @@ func (cs *Consumer) Run(ctx context.Context) {
 			var cmd Command
 			if err := json.Unmarshal(msg.Value, &cmd); err != nil {
 				slog.Error("unmarshal cmd", "err", err)
+				if _, cErr := cs.c.CommitMessage(msg); cErr != nil {
+					slog.Error("commit offset", "err", cErr)
+				}
 				continue
 			}
 
@@ -109,12 +118,16 @@ func (cs *Consumer) Run(ctx context.Context) {
 					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
 					continue
 				}
-				failCount++
-				if failCount >= 3 {
+				key := offsetKey(msg)
+				failCounts[key]++
+				if failCounts[key] >= 3 {
 					cs.prod.SendToDLQ("pedidos", *msg.TopicPartition.Topic,
-						string(msg.Key), msg.Value, err, failCount)
-					slog.Warn("sent to DLQ after repeated failures", "topic", *msg.TopicPartition.Topic, "attempts", failCount)
-					failCount = 0
+						string(msg.Key), msg.Value, err, failCounts[key])
+					slog.Warn("sent to DLQ after repeated failures", "topic", *msg.TopicPartition.Topic, "attempts", failCounts[key])
+					delete(failCounts, key)
+					if _, cErr := cs.c.CommitMessage(msg); cErr != nil {
+						slog.Error("commit offset", "err", cErr)
+					}
 					continue
 				}
 				reply = Reply{
@@ -124,12 +137,16 @@ func (cs *Consumer) Run(ctx context.Context) {
 					RepliedAt: time.Now().UTC(),
 				}
 			} else {
-				failCount = 0
+				delete(failCounts, offsetKey(msg))
 			}
 
 			replyTopic := replyTopicFor(cmd.CommandType)
 			if err := cs.prod.PublishReply(replyTopic, reply); err != nil {
 				slog.Error("publish reply", "err", err)
+				continue
+			}
+			if _, cErr := cs.c.CommitMessage(msg); cErr != nil {
+				slog.Error("commit offset", "err", cErr)
 			}
 		}
 	}

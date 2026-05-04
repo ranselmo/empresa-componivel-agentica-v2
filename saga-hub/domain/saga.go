@@ -19,6 +19,7 @@ const (
 	StepReservarEstoque   SagaStep = "RESERVAR_ESTOQUE"
 	StepEnviarNotificacao SagaStep = "ENVIAR_NOTIFICACAO"
 	StepCompensarPedido   SagaStep = "COMPENSAR_PEDIDO"
+	StepLiberarEstoque    SagaStep = "LIBERAR_ESTOQUE"
 )
 
 // Tópicos Kafka — contrato único para todo o sistema
@@ -27,16 +28,19 @@ const (
 	TopicCmdPedidoCriar       = "commands.pedidos.criar"
 	TopicCmdPedidoCancelar    = "commands.pedidos.cancelar"
 	TopicCmdEstoqueReservar   = "commands.estoque.reservar"
+	TopicCmdEstoqueLiberar    = "commands.estoque.liberar"
 	TopicCmdNotificacaoEnviar = "commands.notificacoes.enviar"
 	// PBC → saga-hub
 	TopicReplyPedidoCriado        = "replies.pedidos.criado"
 	TopicReplyPedidoCancelado     = "replies.pedidos.cancelado"
 	TopicReplyEstoqueReservado    = "replies.estoque.reservado"
 	TopicReplyEstoqueInsuficiente = "replies.estoque.insuficiente"
+	TopicReplyEstoqueLiberado     = "replies.estoque.liberado"
 	TopicReplyNotificacaoEnviada  = "replies.notificacoes.enviada"
 	// PBC → todos (democratizado)
 	TopicEventPedidoConfirmado   = "events.pedidos.confirmado"
 	TopicEventPedidoCancelado    = "events.pedidos.cancelado"
+	TopicEventPedidoFalhou       = "events.pedidos.falhou"
 	TopicEventNotificacaoEnviada = "events.notificacoes.enviada"
 )
 

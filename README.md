@@ -412,6 +412,24 @@ docker compose up -d && ./check.sh --full
 
 ## Changelog
 
+### v2.9.0 — 2026-05-04
+
+**REFINE.md Fase R1 — Correção de bugs críticos e segurança**
+
+- **R1.1**: `ReservarItens` e `LiberarItens` com transação PostgreSQL (`SELECT FOR UPDATE`) em `cell-estoque/infra/db/store.go` — elimina race condition em reservas concorrentes
+- **R1.2**: Compensação completa da SAGA: `onPedidoCancelado` agora publica `liberar_estoque` (novo tópico `commands.estoque.liberar`); `onEstoqueLiberado` marca saga como FAILED e notifica cliente. Saga nunca mais termina em COMPENSATING sem liberar o estoque.
+- **R1.3**: Propagação de erro de `pedido.Cancelar()` — não mais silenciado com `_ = pedido.Cancelar()`
+- **R1.4**: Todos os 5 `_ = o.store.Save(ctx, saga)` em `saga-hub/orchestrator/pedido.go` agora logam o erro
+- **R1.5**: `json.Unmarshal` de itens em `cell-pedidos/infra/db/store.go` retorna/loga erro em vez de ignorar
+- **R1.6**: `uuid.Parse` no handler `/estoque/:id/repor` valida e retorna 400 em vez de usar UUID zero
+- **R1.7**: Allowlist de tabelas e colunas em `data-sync/infra/applier.go` — previne SQL injection via mensagens Debezium maliciosas
+- **R1.8**: DSNs hardcoded removidos de todos os stores (cell-estoque, cell-pedidos, cell-notificacoes, saga-hub) — `DATABASE_URL` é obrigatória
+- **R1.9**: Todos os 5 consumers Kafka mudaram de `enable.auto.commit: true` para `false` com commit manual pós-processamento — garante at-least-once; failCounts agora por offset (R4.5), detecção de timeout via `kafka.Error.Code()` (R4.4)
+- **R2.5**: `var _ = time.Now` artifact removido de `saga-hub/infra/db/store.go`
+- **R3.5**: `failSaga` publica evento `events.pedidos.falhou` para rastreabilidade de falhas
+
+---
+
 ### v2.8.0 — 2026-05-04
 
 **Revisão de código completa + REFINE.md (SDD de refinamento)**

@@ -85,8 +85,12 @@ func (h *Handler) cmdCancelarPedido(ctx context.Context, cmd messaging.Command) 
 	if err != nil {
 		return failReply(cmd, "pedido not found"), nil
 	}
-	_ = pedido.Cancelar()
-	_ = h.store.Salvar(ctx, pedido)
+	if err := pedido.Cancelar(); err != nil {
+		return failReply(cmd, err.Error()), nil
+	}
+	if err := h.store.Salvar(ctx, pedido); err != nil {
+		return messaging.Reply{}, fmt.Errorf("salvar pedido cancelado: %w", err)
+	}
 
 	return messaging.Reply{
 		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,

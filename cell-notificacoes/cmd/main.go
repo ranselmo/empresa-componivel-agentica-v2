@@ -66,9 +66,6 @@ type Store struct {
 
 func newStore(ctx context.Context) (*Store, error) {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://notificacoes:notif123@localhost:5435/notificacoes?sslmode=disable"
-	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
@@ -189,10 +186,11 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *au
 
 	groupID := fmt.Sprintf("cell-notificacoes-%s-%s-cmd", shardID, cellRole)
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  kafkaBrokers(),
-		"group.id":           groupID,
-		"auto.offset.reset":  "earliest",
-		"enable.auto.commit": true,
+		"bootstrap.servers":        kafkaBrokers(),
+		"group.id":                 groupID,
+		"auto.offset.reset":        "earliest",
+		"enable.auto.commit":       false,
+		"enable.auto.offset.store": false,
 	})
 	if err != nil {
 		slog.Error("kafka consumer", "err", err)
@@ -203,7 +201,7 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *au
 	slog.Info("command consumer started", "group", groupID)
 
 	bh := resilience.NewBulkhead("cell-notificacoes", shardID, "cmd-processor", 10)
-	failCount := 0
+	failCounts := make(map[string]int)
 
 	for {
 		select {
@@ -212,7 +210,8 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *au
 		default:
 			msg, err := c.ReadMessage(200)
 			if err != nil {
-				if !strings.Contains(strings.ToLower(err.Error()), "timed out") {
+				kafkaErr, ok := err.(kafka.Error)
+				if !ok || kafkaErr.Code() != kafka.ErrTimedOut {
 					slog.Error("read", "err", err)
 				}
 				continue
@@ -220,6 +219,9 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *au
 			var cmd Command
 			if err := json.Unmarshal(msg.Value, &cmd); err != nil {
 				slog.Error("unmarshal cmd", "err", err)
+				if _, cErr := c.CommitMessage(msg); cErr != nil {
+					slog.Error("commit offset", "err", cErr)
+				}
 				continue
 			}
 
@@ -232,15 +234,22 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *au
 					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
 					continue
 				}
-				failCount++
-				if failCount >= 3 {
+				key := fmt.Sprintf("%d:%d", msg.TopicPartition.Partition, msg.TopicPartition.Offset)
+				failCounts[key]++
+				if failCounts[key] >= 3 {
 					messaging.SendToDLQ(prod, "notificacoes", *msg.TopicPartition.Topic,
-						string(msg.Key), msg.Value, err, failCount)
-					slog.Warn("sent to DLQ", "topic", *msg.TopicPartition.Topic, "attempts", failCount)
-					failCount = 0
+						string(msg.Key), msg.Value, err, failCounts[key])
+					slog.Warn("sent to DLQ", "topic", *msg.TopicPartition.Topic, "attempts", failCounts[key])
+					delete(failCounts, key)
+					if _, cErr := c.CommitMessage(msg); cErr != nil {
+						slog.Error("commit offset", "err", cErr)
+					}
 				}
 			} else {
-				failCount = 0
+				delete(failCounts, fmt.Sprintf("%d:%d", msg.TopicPartition.Partition, msg.TopicPartition.Offset))
+				if _, cErr := c.CommitMessage(msg); cErr != nil {
+					slog.Error("commit offset", "err", cErr)
+				}
 			}
 		}
 	}

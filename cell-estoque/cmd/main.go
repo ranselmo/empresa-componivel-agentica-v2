@@ -15,7 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/audit"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/auth"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/db"
+	dbpkg "github.com/ranselmo/poc-eci/cell-estoque/infra/db"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/messaging"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -48,7 +48,7 @@ func setupOTel(ctx context.Context) func() {
 }
 
 // estoqueProcessor implementa messaging.CommandProcessor
-type estoqueProcessor struct{ store *db.Store }
+type estoqueProcessor struct{ store *dbpkg.Store }
 
 func (ep *estoqueProcessor) ProcessCommand(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
 	switch cmd.CommandType {
@@ -66,27 +66,17 @@ func (ep *estoqueProcessor) reservar(ctx context.Context, cmd messaging.Command)
 	if len(itensRaw) == 0 {
 		return failReply(cmd, messaging.TopicReplyInsuficiente, "itens required"), nil
 	}
+	var itens []dbpkg.ReservaItem
 	for _, ir := range itensRaw {
 		im, _ := ir.(map[string]any)
 		prodID, err := uuid.Parse(fmt.Sprintf("%v", im["produto_id"]))
 		if err != nil {
 			return failReply(cmd, messaging.TopicReplyInsuficiente, "invalid produto_id"), nil
 		}
-		qty := toInt(im["quantidade"])
-
-		prod, err := ep.store.BuscarPorID(ctx, prodID)
-		if err != nil {
-			return failReply(cmd, messaging.TopicReplyInsuficiente,
-				fmt.Sprintf("produto %s não encontrado", prodID)), nil
-		}
-		if !prod.Reservar(qty) {
-			return failReply(cmd, messaging.TopicReplyInsuficiente,
-				fmt.Sprintf("estoque insuficiente produto %s: disponivel=%d solicitado=%d",
-					prodID, prod.QuantidadeDisponivel, qty)), nil
-		}
-		if err := ep.store.Salvar(ctx, prod); err != nil {
-			return messaging.Reply{}, fmt.Errorf("salvar produto: %w", err)
-		}
+		itens = append(itens, dbpkg.ReservaItem{ProdutoID: prodID, Quantidade: toInt(im["quantidade"])})
+	}
+	if err := ep.store.ReservarItens(ctx, itens); err != nil {
+		return failReply(cmd, messaging.TopicReplyInsuficiente, err.Error()), nil
 	}
 	return messaging.Reply{
 		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
@@ -96,6 +86,22 @@ func (ep *estoqueProcessor) reservar(ctx context.Context, cmd messaging.Command)
 }
 
 func (ep *estoqueProcessor) liberar(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
+	itensRaw, _ := cmd.Payload["itens"].([]any)
+	if len(itensRaw) == 0 {
+		return failReply(cmd, "", "itens required"), nil
+	}
+	var itens []dbpkg.ReservaItem
+	for _, ir := range itensRaw {
+		im, _ := ir.(map[string]any)
+		prodID, err := uuid.Parse(fmt.Sprintf("%v", im["produto_id"]))
+		if err != nil {
+			return failReply(cmd, "", "invalid produto_id"), nil
+		}
+		itens = append(itens, dbpkg.ReservaItem{ProdutoID: prodID, Quantidade: toInt(im["quantidade"])})
+	}
+	if err := ep.store.LiberarItens(ctx, itens); err != nil {
+		return messaging.Reply{}, fmt.Errorf("liberar itens: %w", err)
+	}
 	return messaging.Reply{
 		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
 		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
@@ -128,7 +134,7 @@ func main() {
 	shardID := os.Getenv("SHARD_ID")
 	cellRole := os.Getenv("CELL_ROLE")
 
-	store, err := db.New(ctx)
+	store, err := dbpkg.New(ctx)
 	if err != nil {
 		slog.Error("db connect", "err", err)
 		os.Exit(1)
@@ -233,7 +239,11 @@ func main() {
 			})
 		})
 		estoque.PUT("/:id/repor", jwtMW, func(c *gin.Context) {
-			id, _ := uuid.Parse(c.Param("id"))
+			id, err := uuid.Parse(c.Param("id"))
+			if err != nil {
+				c.JSON(400, gin.H{"error": "id inválido"})
+				return
+			}
 			var req struct {
 				Quantidade int `json:"quantidade" binding:"required,min=1"`
 			}

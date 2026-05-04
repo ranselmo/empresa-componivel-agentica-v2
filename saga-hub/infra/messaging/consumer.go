@@ -26,10 +26,11 @@ func NewConsumer(handler ReplyHandler) (*Consumer, error) {
 		brokers = "kafka:29092"
 	}
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  brokers,
-		"group.id":           "saga-hub-replies-group",
-		"auto.offset.reset":  "earliest",
-		"enable.auto.commit": "true",
+		"bootstrap.servers":        brokers,
+		"group.id":                 "saga-hub-replies-group",
+		"auto.offset.reset":        "earliest",
+		"enable.auto.commit":       "false",
+		"enable.auto.offset.store": "false",
 	})
 	if err != nil {
 		return nil, err
@@ -39,6 +40,7 @@ func NewConsumer(handler ReplyHandler) (*Consumer, error) {
 		domain.TopicReplyPedidoCancelado,
 		domain.TopicReplyEstoqueReservado,
 		domain.TopicReplyEstoqueInsuficiente,
+		domain.TopicReplyEstoqueLiberado,
 		domain.TopicReplyNotificacaoEnviada,
 	}
 	if err := c.SubscribeTopics(topics, nil); err != nil {
@@ -81,6 +83,10 @@ func (cs *Consumer) Run(ctx context.Context) {
 				}
 				slog.Error("handle reply", "err", err,
 					"correlation_id", reply.CorrelationID, "type", reply.CommandType)
+				continue
+			}
+			if _, err := cs.c.CommitMessage(msg); err != nil {
+				slog.Error("commit offset", "err", err)
 			}
 		}
 	}

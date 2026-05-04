@@ -24,9 +24,6 @@ type Store struct {
 
 func New(ctx context.Context) (*Store, error) {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://estoque:estoque123@localhost:5434/estoque?sslmode=disable"
-	}
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
@@ -135,6 +132,55 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Produto) error {
 		_ = s.cache.Del(ctx, p.ID.String())
 	}
 	return err
+}
+
+type ReservaItem struct {
+	ProdutoID uuid.UUID
+	Quantidade int
+}
+
+func (s *Store) ReservarItens(ctx context.Context, itens []ReservaItem) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	for _, item := range itens {
+		var disponivel int
+		if err := tx.QueryRow(ctx,
+			`SELECT quantidade_disponivel FROM produtos WHERE id=$1 FOR UPDATE`,
+			item.ProdutoID).Scan(&disponivel); err != nil {
+			return fmt.Errorf("produto %s: %w", item.ProdutoID, err)
+		}
+		if disponivel < item.Quantidade {
+			return fmt.Errorf("estoque insuficiente produto %s: disponivel=%d solicitado=%d",
+				item.ProdutoID, disponivel, item.Quantidade)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE produtos SET quantidade_disponivel = quantidade_disponivel - $1, atualizado_em = $2 WHERE id=$3`,
+			item.Quantidade, time.Now().UTC(), item.ProdutoID); err != nil {
+			return fmt.Errorf("update produto %s: %w", item.ProdutoID, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) LiberarItens(ctx context.Context, itens []ReservaItem) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	for _, item := range itens {
+		if _, err := tx.Exec(ctx,
+			`UPDATE produtos SET quantidade_disponivel = quantidade_disponivel + $1, atualizado_em = $2 WHERE id=$3`,
+			item.Quantidade, time.Now().UTC(), item.ProdutoID); err != nil {
+			return fmt.Errorf("liberar produto %s: %w", item.ProdutoID, err)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) Listar(ctx context.Context) ([]*domain.Produto, error) {

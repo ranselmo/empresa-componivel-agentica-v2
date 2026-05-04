@@ -36,6 +36,15 @@ func (p *Produto) Repor(quantidade int) error {
 	return nil
 }
 
+func (p *Produto) Liberar(quantidade int) error {
+	if quantidade <= 0 {
+		return errors.New("quantidade deve ser positiva")
+	}
+	p.QuantidadeDisponivel += quantidade
+	p.AtualizadoEm = time.Now().UTC()
+	return nil
+}
+
 // Tópicos democratizados publicados por este PBC
 const (
 	TopicEventEstoqueReservado    = "events.estoque.reservado"
