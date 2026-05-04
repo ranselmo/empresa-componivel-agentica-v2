@@ -398,12 +398,24 @@ make fitness-check
 | F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | ✅ Completo |
 | F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | ✅ Completo |
 | F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ✅ Completo |
-| F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks | 🟡 Parcial (Runbooks) |
+| F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks, FinOps metrics | ✅ Completo |
 | F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | 🟡 Parcial (anomaly + scaling) |
 
 ---
 
 ## Changelog
+
+### v2.5.0 — 2026-05-04
+
+**F4 — FinOps + SRE (completa)**
+
+- **SLO rules** (`infra/monitoring/slo-rules.yml`): recording rules `shard:availability:rate5m` e `shard:error_budget_burn` com SLO de 99.9% — validado com `promtool check rules` (SUCCESS: 2 rules found).
+- **Alert rules** (`infra/monitoring/alert-rules.yml`): 6 alertas operacionais — `ActiveCellDown` (30s), `BothCellsDown` (10s), `DataSyncLagHigh` (lag > 5s por 1min), `SagaFailureRateHigh` (> 5% por 5min), `CircuitBreakerOpen` (1min), `ErrorBudgetBurn` (burn > 14.4x por 5min). Cada alert referencia seu runbook. Validado com `promtool` (SUCCESS: 6 rules found).
+- **Runbooks** (`runbooks/`): `shard-failover.md`, `data-sync-lag.md` e `circuit-breaker.md` conformes ao template com Trigger, Diagnóstico, Ações corretivas (cenários A/B/C), Verificação de resolução e Escalação.
+- **FinOps metrics** (`infra/monitoring/finops.go`): `cell_transaction_cost_cents` (histogram), `cell_db_queries_total` (counter por operação), `cell_kafka_messages_total` (counter por tópico e direção). Instrumentados em `cell-pedidos` (store Salvar/BuscarPorID + producer PublishReply), `cell-estoque` (idem) e `cell-notificacoes` (publishReply).
+- `prometheus.yml` atualizado com `rule_files` carregando `slo-rules.yml` e `alert-rules.yml`.
+
+---
 
 ### v2.4.0 — 2026-05-04
 
