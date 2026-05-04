@@ -386,6 +386,12 @@ make fitness-check
 
 # Idem + remove imagens buildadas (~15MB × 7) para liberar disco completamente
 ./teardown.sh --images
+
+# Critérios globais de aceitação — checks estáticos (build, boundary, SLO rules)
+./check.sh
+
+# Critérios globais de aceitação — suite completa (requer stack up)
+docker compose up -d && ./check.sh --full
 ```
 
 ---
@@ -404,6 +410,15 @@ make fitness-check
 ---
 
 ## Changelog
+
+### v2.7.0 — 2026-05-04
+
+**§9 — Critérios Globais de Aceitação**
+
+- **`check.sh`**: script completo dos critérios globais do PROMPT.md §9. Modo estático (`./check.sh`): BUILD (6 componentes), BOUNDARY CHECK (L1 — zero imports entre PBCs), SLO RULES (promtool). Modo completo (`./check.sh --full`, requer stack up): STACK HEALTH (18 containers), SHARD ROUTING (distribuição X-Client-ID), PASSIVE MODE (HTTP 503 em escrita), SAGA E2E (COMPLETED).
+- Todos os checks estáticos passam: `ALL STATIC CHECKS PASSED`.
+
+---
 
 ### v2.6.0 — 2026-05-04
 
