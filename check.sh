@@ -56,29 +56,33 @@ echo ""
 echo "=== STACK HEALTH ==="
 echo "Aguardando containers estabilizarem (90s)..."
 sleep 90
+# Compose prefixa com "poc-eci-" e sufixo "-1"; notificacoes → cell-notif
 for shard in 1 2 3; do
-  for pbc in pedidos estoque notificacoes; do
+  for pbc in pedidos estoque notif; do
     for role in active passive; do
-      name="cell-${pbc}-s${shard}-${role}"
+      name="poc-eci-cell-${pbc}-s${shard}-${role}-1"
       status=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "missing")
       [ "$status" = "running" ] \
-        && check 0 "$name running" \
-        || check 1 "$name running ($status)"
+        && check 0 "cell-${pbc}-s${shard}-${role} running" \
+        || check 1 "cell-${pbc}-s${shard}-${role} running ($status)"
     done
   done
 done
 
 echo ""
 echo "=== SHARD ROUTING ==="
-declare -A shards_seen
+# bash 3.2 (macOS) — sem associative arrays; conta shards únicos via sort+uniq
+shards_file=$(mktemp)
 for key in "cliente-aaa" "cliente-bbb" "cliente-ccc" "cliente-ddd" "cliente-eee"; do
   shard=$(curl -sf -H "X-Client-ID: $key" http://localhost:8080/healthz/live \
     -D - 2>/dev/null | grep -i "X-Shard-ID" | awk '{print $2}' | tr -d '\r' || echo "")
-  [ -n "$shard" ] && shards_seen[$shard]=1
+  [ -n "$shard" ] && echo "$shard" >> "$shards_file"
 done
-[ "${#shards_seen[@]}" -ge 2 ] \
-  && check 0 "routing distributes across shards (${#shards_seen[@]} shards seen)" \
-  || check 1 "routing distributes across shards (only ${#shards_seen[@]} shards seen)"
+unique_count=$(sort -u "$shards_file" | wc -l | tr -d ' ')
+rm -f "$shards_file"
+[ "$unique_count" -ge 2 ] \
+  && check 0 "routing distributes across shards ($unique_count shards seen)" \
+  || check 1 "routing distributes across shards (only $unique_count shards seen)"
 
 echo ""
 echo "=== PASSIVE MODE ==="

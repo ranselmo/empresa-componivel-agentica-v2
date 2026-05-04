@@ -40,10 +40,15 @@ func (o *PedidoSaga) Start(ctx context.Context, clienteID uuid.UUID, shardID str
 		return nil, fmt.Errorf("save saga: %w", err)
 	}
 	sagaStarted.WithLabelValues("pedido").Inc()
+	cmdPayload := make(map[string]any, len(payload)+1)
+	for k, v := range payload {
+		cmdPayload[k] = v
+	}
+	cmdPayload["cliente_id"] = clienteID.String()
 	cmd := domain.Command{
 		CommandID: uuid.New(), CorrelationID: saga.CorrelationID,
 		SagaID: saga.ID, ShardID: shardID,
-		CommandType: "criar_pedido", Payload: payload,
+		CommandType: "criar_pedido", Payload: cmdPayload,
 		IssuedAt: time.Now().UTC(),
 	}
 	if err := o.prod.PublishCommand(domain.TopicCmdPedidoCriar, cmd); err != nil {
