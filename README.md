@@ -399,11 +399,23 @@ make fitness-check
 | F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | ✅ Completo |
 | F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ✅ Completo |
 | F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks, FinOps metrics | ✅ Completo |
-| F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | 🟡 Parcial (anomaly + scaling) |
+| F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | ✅ Completo |
 
 ---
 
 ## Changelog
+
+### v2.6.0 — 2026-05-04
+
+**F5 — IA Avançada (completa)**
+
+- **F5.1 — Self-healing com consciência de shards** (`agent-mcp/main.py`): `ALL_TOOLS = MCP_TOOLS + SHARD_TOOLS` — Claude recebe todas as 12 tools incluindo `listar_status_shards`, `verificar_saga`, `iniciar_saga_pedido`, `reiniciar_celula` e `consultar_prometheus`. Loop de monitoramento integra anomaly detection: se IsolationForest detecta anomalia, aciona Claude com prompt de self-healing que usa `listar_status_shards` + `consultar_prometheus` + `reiniciar_celula`; caso normal, faz checagem periódica de shards.
+- **F5.2 — Anomaly detection** (`agent-mcp/anomaly/detector.py`): `AnomalyDetector` com `IsolationForest` monitorando `shard_router_requests_total`, `data_sync_lag_seconds`, `saga_duration_seconds` e `circuit_breaker_state`. Treina progressivamente com histórico (mínimo 10 amostras). Exposto em `GET /agente/anomalias`.
+- **F5.3 — Predictive scaling** (`agent-mcp/scaling/predictor.py`): `EMAPPredictor` com EMA (α=0.3) + slope-based forecast de 5 passos à frente por célula (pedidos, estoque, notificacoes). Recomenda réplicas baseado em RPS previsto / 50. Exposto em `GET /agente/scaling/previsao`.
+- `__init__.py` adicionado nos packages `anomaly/` e `scaling/` para importação correta no loop autônomo.
+- `monitor_log` enriquecido com `anomalia`, `previsoes_scaling` e `tipo` (`monitoramento` | `self-healing`).
+
+---
 
 ### v2.5.0 — 2026-05-04
 

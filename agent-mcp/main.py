@@ -172,6 +172,9 @@ MCP_TOOLS = [
     },
 ]
 
+# F5.1: todas as tools disponíveis ao Claude — MCP + shard-aware
+ALL_TOOLS = MCP_TOOLS + SHARD_TOOLS
+
 
 async def executar_tool(name: str, inputs: dict) -> str:
     shard_tool_names = {t["name"] for t in SHARD_TOOLS}
@@ -217,7 +220,7 @@ async def _verificar_saude(http: httpx.AsyncClient) -> str:
     resultados = {}
     for nome, url in cells.items():
         try:
-            r = await http.get(f"{url}/health", timeout=3.0)
+            r = await http.get(f"{url}/healthz/live", timeout=3.0)
             resultados[nome] = {
                 "status": "healthy" if r.status_code == 200 else "degraded",
                 "http_status": r.status_code,
@@ -237,9 +240,10 @@ async def _verificar_saude(http: httpx.AsyncClient) -> str:
 
 async def executar_agente(prompt: str, historico: list = None) -> str:
     mensagens = (historico or []) + [{"role": "user", "content": prompt}]
-    system = """Você é o Agente de Monitoramento da Empresa Componível Inteligente.
-As células de negócio são escritas em Go e se comunicam via Kafka.
-Você as acessa via HTTP através de ferramentas MCP.
+    system = """Você é o Agente de Self-Healing da Empresa Componível Inteligente.
+As células de negócio são escritas em Go e se comunicam via Kafka em 3 shards.
+Você acessa o sistema via ferramentas MCP e tem capacidade de diagnosticar problemas,
+consultar métricas Prometheus, verificar status de shards e reiniciar células com falha.
 Responda em português brasileiro. Seja direto e objetivo."""
 
     for _ in range(10):
@@ -247,7 +251,7 @@ Responda em português brasileiro. Seja direto e objetivo."""
             model="claude-sonnet-4-6",
             max_tokens=2048,
             system=system,
-            tools=MCP_TOOLS,
+            tools=ALL_TOOLS,
             messages=mensagens,
         )
         if response.stop_reason == "end_turn":
@@ -271,23 +275,65 @@ Responda em português brasileiro. Seja direto e objetivo."""
 
 monitor_log: list[dict] = []
 
+
 async def loop_monitoramento():
+    """F5.1: self-healing autônomo com consciência de shards e anomaly detection."""
+    from anomaly.detector import detector
+    from scaling.predictor import predictors
+
     await asyncio.sleep(45)
-    logger.info("Loop de monitoramento autônomo iniciado (Go cells + Kafka)")
+    logger.info("Loop de monitoramento autônomo iniciado (Go cells + Kafka + self-healing)")
+
     while True:
         try:
-            resultado = await executar_agente(
-                "Verifique a saúde de todas as células Go. "
-                "Se alguma estiver degradada, diagnostique e recomende ação corretiva."
-            )
-            monitor_log.append({
+            # F5.2: coleta anomalias com IsolationForest
+            anomalia = await detector.run_once()
+
+            # F5.3: previsão de scaling por célula
+            previsoes = []
+            for pred in predictors.values():
+                previsoes.append(await pred.predict())
+
+            entrada_log = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "resultado": resultado,
-            })
+                "anomalia": anomalia,
+                "previsoes_scaling": previsoes,
+            }
+
+            if anomalia.get("anomaly"):
+                # F5.1: self-healing — Claude diagnostica e age com shard awareness
+                score = anomalia.get("score", 0)
+                metricas = anomalia.get("metrics", {})
+                logger.warning(f"Anomalia detectada (score={score:.3f}): {metricas}")
+
+                resultado = await executar_agente(
+                    f"ALERTA DE ANOMALIA DETECTADA pelo IsolationForest.\n"
+                    f"Score de anomalia: {score:.4f} (mais negativo = mais anômalo).\n"
+                    f"Métricas coletadas: {json.dumps(metricas, ensure_ascii=False)}.\n"
+                    f"Use listar_status_shards para verificar saúde dos shards, "
+                    f"consultar_prometheus para investigar as métricas suspeitas, "
+                    f"e reiniciar_celula se identificar célula com falha. "
+                    f"Reporte o diagnóstico e as ações tomadas."
+                )
+                entrada_log["tipo"] = "self-healing"
+                entrada_log["resultado"] = resultado
+                logger.info(f"Self-healing concluído: {resultado[:200]}")
+            else:
+                # Monitoramento normal — verifica shards periodicamente
+                resultado = await executar_agente(
+                    "Verifique o status de todos os shards com listar_status_shards. "
+                    "Reporte brevemente a saúde do sistema."
+                )
+                entrada_log["tipo"] = "monitoramento"
+                entrada_log["resultado"] = resultado
+
+            monitor_log.append(entrada_log)
             if len(monitor_log) > 100:
                 monitor_log.pop(0)
+
         except Exception as e:
             logger.error(f"Erro no monitoramento: {e}")
+
         await asyncio.sleep(60)
 
 
@@ -295,7 +341,7 @@ async def loop_monitoramento():
 async def lifespan(app: FastAPI):
     if ANTHROPIC_API_KEY:
         asyncio.create_task(loop_monitoramento())
-        logger.info("Agente MCP iniciado — monitorando células Go via HTTP")
+        logger.info("Agente MCP iniciado — self-healing autônomo ativo")
     else:
         logger.warning("ANTHROPIC_API_KEY não definida — modo passivo")
     yield
@@ -303,7 +349,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Agente MCP — PoC ECI (Go + Kafka)",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -326,7 +372,7 @@ async def ver_log():
 
 @app.get("/agente/tools")
 async def listar_tools():
-    return {"tools": [{"name": t["name"], "description": t["description"]} for t in MCP_TOOLS]}
+    return {"tools": [{"name": t["name"], "description": t["description"]} for t in ALL_TOOLS]}
 
 
 @app.get("/agente/anomalias")
@@ -347,4 +393,4 @@ async def scaling_previsao():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "agent-mcp", "version": "2.0.0"}
+    return {"status": "ok", "service": "agent-mcp", "version": "2.1.0"}
