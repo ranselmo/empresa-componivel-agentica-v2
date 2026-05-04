@@ -76,6 +76,12 @@ func main() {
 
 	r := gin.New()
 	r.Use(gin.Recovery(), otelgin.Middleware("saga-hub"))
+	r.Use(func(c *gin.Context) {
+		reqCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(reqCtx)
+		c.Next()
+	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	sagaapi.New(orch, store).Register(r)
 

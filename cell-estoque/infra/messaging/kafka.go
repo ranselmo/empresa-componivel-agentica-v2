@@ -11,12 +11,12 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
 )
 
-// Tópicos exclusivos do PBC estoque
 const (
-	TopicCmdReservar    = "commands.estoque.reservar"
-	TopicCmdLiberar     = "commands.estoque.liberar"
+	TopicCmdReservar       = "commands.estoque.reservar"
+	TopicCmdLiberar        = "commands.estoque.liberar"
 	TopicReplyReservado    = "replies.estoque.reservado"
 	TopicReplyInsuficiente = "replies.estoque.insuficiente"
 )
@@ -46,7 +46,10 @@ type CommandProcessor interface {
 	ProcessCommand(ctx context.Context, cmd Command) (Reply, error)
 }
 
-type Producer struct{ p *kafka.Producer }
+type Producer struct {
+	p       *kafka.Producer
+	breaker *resilience.Breaker
+}
 
 func NewProducer() (*Producer, error) {
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -68,25 +71,32 @@ func NewProducer() (*Producer, error) {
 			}
 		}
 	}()
-	return &Producer{p: p}, nil
+	shardID := os.Getenv("SHARD_ID")
+	return &Producer{
+		p:       p,
+		breaker: resilience.NewBreaker("cell-estoque", shardID, "kafka-producer"),
+	}, nil
 }
 
 func (pr *Producer) PublishReply(topic string, reply Reply) error {
 	b, _ := json.Marshal(reply)
 	key := reply.CorrelationID.String()
-	return pr.p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(key), Value: b,
-	}, nil)
+	return pr.breaker.Execute(func() error {
+		return pr.p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(key), Value: b,
+		}, nil)
+	})
 }
 
 func (pr *Producer) Flush() { pr.p.Flush(5000) }
 func (pr *Producer) Close() { pr.p.Flush(5000); pr.p.Close() }
 
 type Consumer struct {
-	c    *kafka.Consumer
-	proc CommandProcessor
-	prod *Producer
+	c        *kafka.Consumer
+	proc     CommandProcessor
+	prod     *Producer
+	bulkhead *resilience.Bulkhead
 }
 
 func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
@@ -94,17 +104,15 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 	if brokers == "" {
 		brokers = "kafka:29092"
 	}
-
 	shardID := os.Getenv("SHARD_ID")
 	cellRole := os.Getenv("CELL_ROLE")
 
 	if cellRole == "passive" {
 		slog.Info("passive cell — command consumer disabled", "shard", shardID)
-		return &Consumer{}, nil
+		return &Consumer{bulkhead: resilience.NewBulkhead("cell-estoque", shardID, "cmd-processor", 10)}, nil
 	}
 
 	groupID := fmt.Sprintf("cell-estoque-%s-%s-cmd", shardID, cellRole)
-
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers":  brokers,
 		"group.id":           groupID,
@@ -114,12 +122,16 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if err := c.SubscribeTopics([]string{TopicCmdReservar, TopicCmdLiberar}, nil); err != nil {
 		return nil, err
 	}
 	slog.Info("command consumer started", "group", groupID, "shard", shardID)
-	return &Consumer{c: c, proc: proc, prod: prod}, nil
+	return &Consumer{
+		c:        c,
+		proc:     proc,
+		prod:     prod,
+		bulkhead: resilience.NewBulkhead("cell-estoque", shardID, "cmd-processor", 10),
+	}, nil
 }
 
 func (cs *Consumer) Run(ctx context.Context) {
@@ -146,8 +158,19 @@ func (cs *Consumer) Run(ctx context.Context) {
 				slog.Error("unmarshal cmd", "err", err)
 				continue
 			}
-			reply, err := cs.proc.ProcessCommand(ctx, cmd)
+
+			var reply Reply
+			err = cs.bulkhead.Do(ctx, func() error {
+				var processErr error
+				reply, processErr = cs.proc.ProcessCommand(ctx, cmd)
+				return processErr
+			})
+
 			if err != nil {
+				if strings.Contains(err.Error(), "capacity exceeded") {
+					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
+					continue
+				}
 				failCount++
 				if failCount >= 3 {
 					cs.prod.SendToDLQ("estoque", *msg.TopicPartition.Topic,
@@ -165,6 +188,7 @@ func (cs *Consumer) Run(ctx context.Context) {
 			} else {
 				failCount = 0
 			}
+
 			replyTopic := replyTopicFor(cmd.CommandType, reply.Status)
 			if err := cs.prod.PublishReply(replyTopic, reply); err != nil {
 				slog.Error("publish reply", "err", err)

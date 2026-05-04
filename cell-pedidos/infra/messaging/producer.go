@@ -9,14 +9,14 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
 )
 
-// Tópicos exclusivos do PBC pedidos — nunca importar tópicos de outros PBCs
 const (
-	TopicCmdCriar    = "commands.pedidos.criar"
-	TopicCmdCancelar = "commands.pedidos.cancelar"
-	TopicReplyCriado    = "replies.pedidos.criado"
-	TopicReplyCancelado = "replies.pedidos.cancelado"
+	TopicCmdCriar        = "commands.pedidos.criar"
+	TopicCmdCancelar     = "commands.pedidos.cancelar"
+	TopicReplyCriado     = "replies.pedidos.criado"
+	TopicReplyCancelado  = "replies.pedidos.cancelado"
 	TopicEventConfirmado = "events.pedidos.confirmado"
 )
 
@@ -31,7 +31,10 @@ type Reply struct {
 	RepliedAt     time.Time      `json:"replied_at"`
 }
 
-type Producer struct{ p *kafka.Producer }
+type Producer struct {
+	p       *kafka.Producer
+	breaker *resilience.Breaker
+}
 
 func NewProducer() (*Producer, error) {
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -53,16 +56,22 @@ func NewProducer() (*Producer, error) {
 			}
 		}
 	}()
-	return &Producer{p: p}, nil
+	shardID := os.Getenv("SHARD_ID")
+	return &Producer{
+		p:       p,
+		breaker: resilience.NewBreaker("cell-pedidos", shardID, "kafka-producer"),
+	}, nil
 }
 
 func (pr *Producer) PublishReply(topic string, reply Reply) error {
 	b, _ := json.Marshal(reply)
 	key := reply.CorrelationID.String()
-	return pr.p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(key), Value: b,
-	}, nil)
+	return pr.breaker.Execute(func() error {
+		return pr.p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(key), Value: b,
+		}, nil)
+	})
 }
 
 func (pr *Producer) PublishBusinessEvent(topic string, payload map[string]any) {

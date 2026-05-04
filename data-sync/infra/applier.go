@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/ranselmo/poc-eci/data-sync/infra/resilience"
 )
 
 var (
@@ -23,12 +25,11 @@ var (
 		[]string{"shard", "pbc"})
 )
 
-// Debezium envelopes para PostgreSQL (formato Kafka Connect)
 type debeziumMsg struct {
 	Payload struct {
 		Before map[string]any `json:"before"`
 		After  map[string]any `json:"after"`
-		Op     string         `json:"op"` // "c" "u" "d" "r"(snapshot)
+		Op     string         `json:"op"`
 		Source struct {
 			Table string `json:"table"`
 		} `json:"source"`
@@ -36,8 +37,9 @@ type debeziumMsg struct {
 }
 
 type Applier struct {
-	c     *kafka.Consumer
-	pools map[string]*pgxpool.Pool // "shard-1:pedidos" → pool da passiva
+	c        *kafka.Consumer
+	pools    map[string]*pgxpool.Pool   // "shard-1:pedidos" → pool da passiva
+	breakers map[string]*resilience.Breaker // mesma chave
 }
 
 func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
@@ -80,6 +82,7 @@ func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
 	}
 
 	pools := make(map[string]*pgxpool.Pool)
+	breakers := make(map[string]*resilience.Breaker)
 	for key, dsn := range passiveDSNs {
 		pool, err := pgxpool.New(context.Background(), dsn)
 		if err != nil {
@@ -87,8 +90,9 @@ func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
 			continue
 		}
 		pools[key] = pool
+		breakers[key] = resilience.NewBreaker("data-sync", key, "db-passive")
 	}
-	return &Applier{c: c, pools: pools}, nil
+	return &Applier{c: c, pools: pools, breakers: breakers}, nil
 }
 
 func (a *Applier) Run(ctx context.Context) {
@@ -113,7 +117,6 @@ func (a *Applier) Run(ctx context.Context) {
 
 func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 	topic := *msg.TopicPartition.Topic
-	// topic: cdc.shard-1.pedidos.pedidos
 	parts := strings.SplitN(topic, ".", 4)
 	if len(parts) < 4 {
 		return
@@ -126,6 +129,7 @@ func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 		slog.Debug("no passive pool", "key", key)
 		return
 	}
+	breaker := a.breakers[key]
 
 	var dm debeziumMsg
 	if err := json.Unmarshal(msg.Value, &dm); err != nil {
@@ -138,11 +142,17 @@ func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 	var err error
 	switch dm.Payload.Op {
 	case "c", "r":
-		err = applyInsert(ctx, pool, table, dm.Payload.After)
+		err = applyWithResilience(ctx, breaker, func() error {
+			return applyInsert(ctx, pool, table, dm.Payload.After)
+		})
 	case "u":
-		err = applyUpdate(ctx, pool, table, dm.Payload.Before, dm.Payload.After)
+		err = applyWithResilience(ctx, breaker, func() error {
+			return applyUpdate(ctx, pool, table, dm.Payload.Before, dm.Payload.After)
+		})
 	case "d":
-		err = applyDelete(ctx, pool, table, dm.Payload.Before)
+		err = applyWithResilience(ctx, breaker, func() error {
+			return applyDelete(ctx, pool, table, dm.Payload.Before)
+		})
 	}
 
 	if err != nil {
@@ -151,6 +161,12 @@ func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 		return
 	}
 	applied.WithLabelValues(shard, pbc, dm.Payload.Op).Inc()
+}
+
+func applyWithResilience(ctx context.Context, breaker *resilience.Breaker, fn func() error) error {
+	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+		return breaker.Execute(fn)
+	})
 }
 
 func applyInsert(ctx context.Context, pool *pgxpool.Pool, table string, row map[string]any) error {

@@ -9,13 +9,15 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/ranselmo/poc-eci/saga-hub/domain"
+	"github.com/ranselmo/poc-eci/saga-hub/infra/resilience"
 )
 
 type ReplyHandler func(ctx context.Context, reply domain.Reply) error
 
 type Consumer struct {
-	c       *kafka.Consumer
-	handler ReplyHandler
+	c        *kafka.Consumer
+	handler  ReplyHandler
+	bulkhead *resilience.Bulkhead
 }
 
 func NewConsumer(handler ReplyHandler) (*Consumer, error) {
@@ -42,7 +44,11 @@ func NewConsumer(handler ReplyHandler) (*Consumer, error) {
 	if err := c.SubscribeTopics(topics, nil); err != nil {
 		return nil, err
 	}
-	return &Consumer{c: c, handler: handler}, nil
+	return &Consumer{
+		c:        c,
+		handler:  handler,
+		bulkhead: resilience.NewBulkhead("saga-hub", "", "reply-handler", 20),
+	}, nil
 }
 
 func (cs *Consumer) Run(ctx context.Context) {
@@ -65,7 +71,14 @@ func (cs *Consumer) Run(ctx context.Context) {
 				slog.Error("unmarshal reply", "err", err)
 				continue
 			}
-			if err := cs.handler(ctx, reply); err != nil {
+			err = cs.bulkhead.Do(ctx, func() error {
+				return cs.handler(ctx, reply)
+			})
+			if err != nil {
+				if strings.Contains(err.Error(), "capacity exceeded") {
+					slog.Warn("bulkhead rejected reply", "type", reply.CommandType)
+					continue
+				}
 				slog.Error("handle reply", "err", err,
 					"correlation_id", reply.CorrelationID, "type", reply.CommandType)
 			}

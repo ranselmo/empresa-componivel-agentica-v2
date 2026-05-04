@@ -8,9 +8,13 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/ranselmo/poc-eci/saga-hub/domain"
+	"github.com/ranselmo/poc-eci/saga-hub/infra/resilience"
 )
 
-type Producer struct{ p *kafka.Producer }
+type Producer struct {
+	p       *kafka.Producer
+	breaker *resilience.Breaker
+}
 
 func NewProducer() (*Producer, error) {
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -32,7 +36,10 @@ func NewProducer() (*Producer, error) {
 			}
 		}
 	}()
-	return &Producer{p: p}, nil
+	return &Producer{
+		p:       p,
+		breaker: resilience.NewBreaker("saga-hub", "", "kafka-producer"),
+	}, nil
 }
 
 func (pr *Producer) PublishCommand(topic string, cmd domain.Command) error {
@@ -41,11 +48,13 @@ func (pr *Producer) PublishCommand(topic string, cmd domain.Command) error {
 		return err
 	}
 	key := cmd.CorrelationID.String()
-	return pr.p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(key),
-		Value:          b,
-	}, nil)
+	return pr.breaker.Execute(func() error {
+		return pr.p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(key),
+			Value:          b,
+		}, nil)
+	})
 }
 
 func (pr *Producer) PublishBusinessEvent(topic string, ev domain.BusinessEvent) {

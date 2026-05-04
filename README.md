@@ -384,7 +384,7 @@ make fitness-check
 | Fase | Descrição | Status |
 |---|---|---|
 | F0 — Fundação | shard-router, saga-hub, data-sync, PBCs Async Request-Reply | ✅ Completo |
-| F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | 🟡 Parcial (DLQ implementada) |
+| F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | ✅ Completo |
 | F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | 🟡 Parcial (k8s + CQRS) |
 | F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ⬜ Pendente |
 | F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks | 🟡 Parcial (Runbooks) |
@@ -393,6 +393,22 @@ make fitness-check
 ---
 
 ## Changelog
+
+### v2.2.0 — 2026-05-03
+
+**F1 — Resiliência (completa)**
+
+- `infra/resilience/` criado em todos os 6 módulos Go (`cell-pedidos`, `cell-estoque`, `cell-notificacoes`, `saga-hub`, `shard-router`, `data-sync`)
+- **Circuit Breaker** (`breaker.go`): `Breaker.Execute(fn)` wrapping `gobreaker` — 3 falhas consecutivas abrem o CB, timeout de 30s para half-open, estado exposto via métrica `circuit_breaker_state{component,shard,breaker}`
+- **Retry com backoff** (`retry.go`): `Retry(ctx, maxAttempts, base, fn)` — exponential backoff com jitter (`rand/v2`), respeita context deadline
+- **Bulkhead** (`bulkhead.go`): semáforo com capacidade 10 (cells) / 20 (saga-hub) — rejeições contabilizadas em `bulkhead_rejected_total{component,shard,name}`
+- **Wiring CB+Retry**: acessos a PostgreSQL (Salvar, BuscarPorID) em `cell-pedidos`, `cell-estoque`, `cell-notificacoes`, `saga-hub`; publicações Kafka em todos os producers
+- **Wiring Bulkhead**: consumers Kafka de todas as células e do saga-hub envolvem `ProcessCommand`/`HandleReply` com bulkhead — rejeições por capacidade são descartadas sem incrementar failCount
+- **Timeout middleware** adicionado ao `saga-hub/cmd/main.go` (5s por request)
+- **CB no shard-router**: um `Breaker` por PBC (`pedidos`, `estoque`, `notificacoes`) envolve cada chamada de proxy reverso; falhas de transporte são contabilizadas no CB
+- Dependência `github.com/sony/gobreaker v0.5.0` adicionada a todos os 6 módulos
+
+---
 
 ### v2.1.0 — 2026-05-03
 

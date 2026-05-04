@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/resilience"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -26,14 +27,12 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
 
-// Tópicos exclusivos deste PBC
 const (
-	TopicCmdEnviar      = "commands.notificacoes.enviar"
-	TopicReplyEnviada   = "replies.notificacoes.enviada"
-	TopicEventEnviada   = "events.notificacoes.enviada"
+	TopicCmdEnviar    = "commands.notificacoes.enviar"
+	TopicReplyEnviada = "replies.notificacoes.enviada"
+	TopicEventEnviada = "events.notificacoes.enviada"
 )
 
-// Command recebido do saga-hub
 type Command struct {
 	CommandID     uuid.UUID      `json:"command_id"`
 	CorrelationID uuid.UUID      `json:"correlation_id"`
@@ -44,7 +43,6 @@ type Command struct {
 	IssuedAt      time.Time      `json:"issued_at"`
 }
 
-// Reply enviado de volta ao saga-hub
 type Reply struct {
 	ReplyID       uuid.UUID      `json:"reply_id"`
 	CorrelationID uuid.UUID      `json:"correlation_id"`
@@ -56,8 +54,10 @@ type Reply struct {
 	RepliedAt     time.Time      `json:"replied_at"`
 }
 
-// ── DB ─────────────────────────────────────────────────────────────
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool    *pgxpool.Pool
+	breaker *resilience.Breaker
+}
 
 func newStore(ctx context.Context) (*Store, error) {
 	dsn := os.Getenv("DATABASE_URL")
@@ -78,15 +78,26 @@ func newStore(ctx context.Context) (*Store, error) {
 			enviado_em      TIMESTAMPTZ NOT NULL
 		);
 	`)
-	return &Store{pool: pool}, err
+	if err != nil {
+		return nil, err
+	}
+	shardID := os.Getenv("SHARD_ID")
+	return &Store{
+		pool:    pool,
+		breaker: resilience.NewBreaker("cell-notificacoes", shardID, "db"),
+	}, nil
 }
 
 func (s *Store) Salvar(ctx context.Context, id, destID uuid.UUID, tipo, canal, conteudo string) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO notificacoes (id, destinatario_id, tipo, canal, conteudo, enviado_em)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, destID, tipo, canal, conteudo, time.Now().UTC())
-	return err
+	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+		return s.breaker.Execute(func() error {
+			_, err := s.pool.Exec(ctx,
+				`INSERT INTO notificacoes (id, destinatario_id, tipo, canal, conteudo, enviado_em)
+				 VALUES ($1,$2,$3,$4,$5,$6)`,
+				id, destID, tipo, canal, conteudo, time.Now().UTC())
+			return err
+		})
+	})
 }
 
 func (s *Store) Listar(ctx context.Context) ([]gin.H, error) {
@@ -114,7 +125,6 @@ func (s *Store) Listar(ctx context.Context) ([]gin.H, error) {
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 func (s *Store) Close()                         { s.pool.Close() }
 
-// ── Kafka ──────────────────────────────────────────────────────────
 func kafkaBrokers() string {
 	b := os.Getenv("KAFKA_BROKERS")
 	if b == "" {
@@ -162,11 +172,12 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer) {
 		return
 	}
 	defer c.Close()
-
 	_ = c.SubscribeTopics([]string{TopicCmdEnviar}, nil)
 	slog.Info("command consumer started", "group", groupID)
 
+	bh := resilience.NewBulkhead("cell-notificacoes", shardID, "cmd-processor", 10)
 	failCount := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -184,7 +195,16 @@ func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer) {
 				slog.Error("unmarshal cmd", "err", err)
 				continue
 			}
-			if err := processCmd(ctx, store, prod, cmd); err != nil {
+
+			err = bh.Do(ctx, func() error {
+				return processCmd(ctx, store, prod, cmd)
+			})
+
+			if err != nil {
+				if strings.Contains(err.Error(), "capacity exceeded") {
+					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
+					continue
+				}
 				failCount++
 				if failCount >= 3 {
 					messaging.SendToDLQ(prod, "notificacoes", *msg.TopicPartition.Topic,
@@ -228,7 +248,6 @@ func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, cmd Com
 		Payload: map[string]any{"notificacao_id": notifID.String()},
 	})
 
-	// Publica evento democratizado
 	evTopic := TopicEventEnviada
 	ev, _ := json.Marshal(map[string]any{
 		"event_id": uuid.New().String(), "tipo": tipo,
@@ -241,7 +260,6 @@ func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, cmd Com
 	return nil
 }
 
-// ── OTel ───────────────────────────────────────────────────────────
 func setupOTel(ctx context.Context) func() {
 	svcName := os.Getenv("OTEL_SERVICE_NAME")
 	if svcName == "" {
@@ -263,7 +281,6 @@ func setupOTel(ctx context.Context) func() {
 	return func() { _ = tp.Shutdown(context.Background()) }
 }
 
-// ── Main ───────────────────────────────────────────────────────────
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, cancel := context.WithCancel(context.Background())

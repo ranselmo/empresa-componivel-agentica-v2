@@ -9,9 +9,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-estoque/domain"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
 )
 
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool    *pgxpool.Pool
+	breaker *resilience.Breaker
+}
 
 func New(ctx context.Context) (*Store, error) {
 	dsn := os.Getenv("DATABASE_URL")
@@ -27,7 +31,12 @@ func New(ctx context.Context) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-	return &Store{pool: pool}, nil
+
+	shardID := os.Getenv("SHARD_ID")
+	return &Store{
+		pool:    pool,
+		breaker: resilience.NewBreaker("cell-estoque", shardID, "db"),
+	}, nil
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -48,9 +57,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 func (s *Store) seed(ctx context.Context) error {
 	seeds := []struct {
-		id   string
-		nome string
-		qty  int
+		id    string
+		nome  string
+		qty   int
 		preco float64
 	}{
 		{"11111111-1111-1111-1111-111111111111", "Notebook Pro", 10, 4999.90},
@@ -72,24 +81,31 @@ func (s *Store) seed(ctx context.Context) error {
 }
 
 func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Produto, error) {
-	row := s.pool.QueryRow(ctx,
-		`SELECT id, nome, quantidade_disponivel, preco, atualizado_em FROM produtos WHERE id=$1`, id)
 	var p domain.Produto
-	if err := row.Scan(&p.ID, &p.Nome, &p.QuantidadeDisponivel, &p.Preco, &p.AtualizadoEm); err != nil {
+	err := s.breaker.Execute(func() error {
+		row := s.pool.QueryRow(ctx,
+			`SELECT id, nome, quantidade_disponivel, preco, atualizado_em FROM produtos WHERE id=$1`, id)
+		return row.Scan(&p.ID, &p.Nome, &p.QuantidadeDisponivel, &p.Preco, &p.AtualizadoEm)
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
 func (s *Store) Salvar(ctx context.Context, p *domain.Produto) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO produtos (id, nome, quantidade_disponivel, preco, atualizado_em)
-		VALUES ($1,$2,$3,$4,$5)
-		ON CONFLICT (id) DO UPDATE SET
-			quantidade_disponivel = EXCLUDED.quantidade_disponivel,
-			atualizado_em = EXCLUDED.atualizado_em
-	`, p.ID, p.Nome, p.QuantidadeDisponivel, p.Preco, p.AtualizadoEm)
-	return err
+	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+		return s.breaker.Execute(func() error {
+			_, err := s.pool.Exec(ctx, `
+				INSERT INTO produtos (id, nome, quantidade_disponivel, preco, atualizado_em)
+				VALUES ($1,$2,$3,$4,$5)
+				ON CONFLICT (id) DO UPDATE SET
+					quantidade_disponivel = EXCLUDED.quantidade_disponivel,
+					atualizado_em = EXCLUDED.atualizado_em
+			`, p.ID, p.Nome, p.QuantidadeDisponivel, p.Preco, p.AtualizadoEm)
+			return err
+		})
+	})
 }
 
 func (s *Store) Listar(ctx context.Context) ([]*domain.Produto, error) {

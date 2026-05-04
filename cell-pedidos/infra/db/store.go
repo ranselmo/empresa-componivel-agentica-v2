@@ -10,10 +10,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
 )
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	breaker *resilience.Breaker
 }
 
 func New(ctx context.Context) (*Store, error) {
@@ -33,12 +35,15 @@ func New(ctx context.Context) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-
 	if err := pool.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 
-	return &Store{pool: pool}, nil
+	shardID := os.Getenv("SHARD_ID")
+	return &Store{
+		pool:    pool,
+		breaker: resilience.NewBreaker("cell-pedidos", shardID, "db"),
+	}, nil
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -71,28 +76,34 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Pedido) error {
 	}
 	itensJSON, _ := json.Marshal(itens)
 
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO pedidos (id, cliente_id, status, valor_total, itens, criado_em, atualizado_em)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
-		ON CONFLICT (id) DO UPDATE SET
-			status = EXCLUDED.status,
-			valor_total = EXCLUDED.valor_total,
-			atualizado_em = EXCLUDED.atualizado_em
-	`, p.ID, p.ClienteID, string(p.Status), p.ValorTotal(), itensJSON, p.CriadoEm, p.AtualizadoEm)
-	return err
+	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+		return s.breaker.Execute(func() error {
+			_, err := s.pool.Exec(ctx, `
+				INSERT INTO pedidos (id, cliente_id, status, valor_total, itens, criado_em, atualizado_em)
+				VALUES ($1,$2,$3,$4,$5,$6,$7)
+				ON CONFLICT (id) DO UPDATE SET
+					status = EXCLUDED.status,
+					valor_total = EXCLUDED.valor_total,
+					atualizado_em = EXCLUDED.atualizado_em
+			`, p.ID, p.ClienteID, string(p.Status), p.ValorTotal(), itensJSON, p.CriadoEm, p.AtualizadoEm)
+			return err
+		})
+	})
 }
 
 func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, error) {
-	row := s.pool.QueryRow(ctx,
-		`SELECT id, cliente_id, status, itens, criado_em, atualizado_em FROM pedidos WHERE id=$1`, id)
-
 	var (
-		pid, cid     uuid.UUID
-		status       string
-		itensRaw     []byte
+		pid, cid              uuid.UUID
+		status                string
+		itensRaw              []byte
 		criadoEm, atualizadoEm time.Time
 	)
-	if err := row.Scan(&pid, &cid, &status, &itensRaw, &criadoEm, &atualizadoEm); err != nil {
+	err := s.breaker.Execute(func() error {
+		row := s.pool.QueryRow(ctx,
+			`SELECT id, cliente_id, status, itens, criado_em, atualizado_em FROM pedidos WHERE id=$1`, id)
+		return row.Scan(&pid, &cid, &status, &itensRaw, &criadoEm, &atualizadoEm)
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -103,7 +114,6 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, 
 		uid, _ := uuid.Parse(r.ProdutoID)
 		itens[i] = domain.ItemPedido{ProdutoID: uid, Quantidade: r.Quantidade, PrecoUnit: r.PrecoUnit}
 	}
-
 	return &domain.Pedido{
 		ID: pid, ClienteID: cid,
 		Status: domain.StatusPedido(status),

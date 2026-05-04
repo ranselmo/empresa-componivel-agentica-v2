@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/ranselmo/poc-eci/shard-router/domain"
 	"github.com/ranselmo/poc-eci/shard-router/infra"
+	"github.com/ranselmo/poc-eci/shard-router/infra/resilience"
 )
 
 var (
@@ -35,9 +37,22 @@ var (
 	}, []string{"shard", "pbc", "role", "cell_id"})
 )
 
-type Handler struct{ reg *infra.Registry }
+type Handler struct {
+	reg      *infra.Registry
+	mu       sync.Mutex
+	breakers map[string]*resilience.Breaker // keyed by pbc
+}
 
-func New(reg *infra.Registry) *Handler { return &Handler{reg: reg} }
+func New(reg *infra.Registry) *Handler {
+	h := &Handler{
+		reg:      reg,
+		breakers: make(map[string]*resilience.Breaker),
+	}
+	for _, pbc := range []string{"pedidos", "estoque", "notificacoes"} {
+		h.breakers[pbc] = resilience.NewBreaker("shard-router", "", pbc+"-proxy")
+	}
+	return h
+}
 
 func (h *Handler) Register(r *gin.Engine) {
 	r.Any("/pedidos/*path", h.proxy("pedidos"))
@@ -50,6 +65,7 @@ func (h *Handler) Register(r *gin.Engine) {
 }
 
 func (h *Handler) proxy(pbc string) gin.HandlerFunc {
+	breaker := h.breakers[pbc]
 	return func(c *gin.Context) {
 		t0 := time.Now()
 
@@ -79,18 +95,27 @@ func (h *Handler) proxy(pbc string) gin.HandlerFunc {
 		c.Request.Header.Set("X-Cell-Role", cell.Role)
 
 		target, _ := url.Parse(cell.BaseURL)
-		rp := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.URL.Scheme = target.Scheme
-				req.URL.Host = target.Host
-				req.Host = target.Host
-			},
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				slog.Error("proxy error", "cell", cell.ID, "err", err)
-				w.WriteHeader(http.StatusBadGateway)
-			},
+
+		proxyErr := breaker.Execute(func() error {
+			var forwardErr error
+			rp := &httputil.ReverseProxy{
+				Director: func(req *http.Request) {
+					req.URL.Scheme = target.Scheme
+					req.URL.Host = target.Host
+					req.Host = target.Host
+				},
+				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+					slog.Error("proxy error", "cell", cell.ID, "err", err)
+					forwardErr = err
+					w.WriteHeader(http.StatusBadGateway)
+				},
+			}
+			rp.ServeHTTP(c.Writer, c.Request)
+			return forwardErr
+		})
+		if proxyErr != nil {
+			slog.Warn("circuit breaker recorded proxy failure", "pbc", pbc, "cell", cell.ID)
 		}
-		rp.ServeHTTP(c.Writer, c.Request)
 
 		reqTotal.WithLabelValues(shard, pbc, cell.Role).Inc()
 		reqDur.WithLabelValues(shard, pbc).Observe(time.Since(t0).Seconds())

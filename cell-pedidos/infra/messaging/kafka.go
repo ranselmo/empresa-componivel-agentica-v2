@@ -11,6 +11,7 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
 )
 
 type Command struct {
@@ -28,9 +29,10 @@ type CommandProcessor interface {
 }
 
 type Consumer struct {
-	c    *kafka.Consumer
-	proc CommandProcessor
-	prod *Producer
+	c        *kafka.Consumer
+	proc     CommandProcessor
+	prod     *Producer
+	bulkhead *resilience.Bulkhead
 }
 
 func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
@@ -44,7 +46,7 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 
 	if cellRole == "passive" {
 		slog.Info("passive cell — command consumer disabled", "shard", shardID)
-		return &Consumer{}, nil
+		return &Consumer{bulkhead: resilience.NewBulkhead("cell-pedidos", shardID, "cmd-processor", 10)}, nil
 	}
 
 	groupID := fmt.Sprintf("cell-pedidos-%s-%s-cmd", shardID, cellRole)
@@ -58,12 +60,16 @@ func NewConsumer(proc CommandProcessor, prod *Producer) (*Consumer, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if err := c.SubscribeTopics([]string{TopicCmdCriar, TopicCmdCancelar}, nil); err != nil {
 		return nil, err
 	}
 	slog.Info("command consumer started", "group", groupID, "shard", shardID)
-	return &Consumer{c: c, proc: proc, prod: prod}, nil
+	return &Consumer{
+		c:        c,
+		proc:     proc,
+		prod:     prod,
+		bulkhead: resilience.NewBulkhead("cell-pedidos", shardID, "cmd-processor", 10),
+	}, nil
 }
 
 func (cs *Consumer) Run(ctx context.Context) {
@@ -90,8 +96,19 @@ func (cs *Consumer) Run(ctx context.Context) {
 				slog.Error("unmarshal cmd", "err", err)
 				continue
 			}
-			reply, err := cs.proc.ProcessCommand(ctx, cmd)
+
+			var reply Reply
+			err = cs.bulkhead.Do(ctx, func() error {
+				var processErr error
+				reply, processErr = cs.proc.ProcessCommand(ctx, cmd)
+				return processErr
+			})
+
 			if err != nil {
+				if strings.Contains(err.Error(), "capacity exceeded") {
+					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
+					continue
+				}
 				failCount++
 				if failCount >= 3 {
 					cs.prod.SendToDLQ("pedidos", *msg.TopicPartition.Topic,
@@ -109,6 +126,7 @@ func (cs *Consumer) Run(ctx context.Context) {
 			} else {
 				failCount = 0
 			}
+
 			replyTopic := replyTopicFor(cmd.CommandType)
 			if err := cs.prod.PublishReply(replyTopic, reply); err != nil {
 				slog.Error("publish reply", "err", err)
