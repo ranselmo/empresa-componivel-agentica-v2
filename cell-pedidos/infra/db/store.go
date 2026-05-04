@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/cache"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/monitoring"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
 )
 
@@ -19,6 +20,7 @@ type Store struct {
 	pool    *pgxpool.Pool
 	breaker *resilience.Breaker
 	cache   *cache.Cache
+	shardID string
 }
 
 func New(ctx context.Context) (*Store, error) {
@@ -52,6 +54,7 @@ func New(ctx context.Context) (*Store, error) {
 		pool:    pool,
 		breaker: resilience.NewBreaker("cell-pedidos", shardID, "db"),
 		cache:   ca,
+		shardID: shardID,
 	}, nil
 }
 
@@ -98,6 +101,8 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Pedido) error {
 			return err
 		})
 	})
+	monitoring.DBQueries.WithLabelValues("cell-pedidos", s.shardID, "salvar").Inc()
+	monitoring.TxCost.WithLabelValues("cell-pedidos", s.shardID, "salvar").Observe(0.001)
 	if err == nil && s.cache != nil {
 		_ = s.cache.Del(ctx, p.ID.String())
 	}
@@ -123,6 +128,7 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, 
 			`SELECT id, cliente_id, status, itens, criado_em, atualizado_em FROM pedidos WHERE id=$1`, id)
 		return row.Scan(&pid, &cid, &status, &itensRaw, &criadoEm, &atualizadoEm)
 	})
+	monitoring.DBQueries.WithLabelValues("cell-pedidos", s.shardID, "buscar").Inc()
 	if err != nil {
 		return nil, err
 	}

@@ -1,0 +1,50 @@
+groups:
+  - name: eci.critical
+    rules:
+      - alert: ActiveCellDown
+        expr: shard_router_cell_health{role="active"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "Célula ativa down: {{ $labels.shard }}/{{ $labels.pbc }}"
+          runbook: "runbooks/shard-failover.md"
+
+      - alert: BothCellsDown
+        expr: sum(shard_router_cell_health) by (shard, pbc) == 0
+        for: 10s
+        labels: { severity: page }
+        annotations:
+          summary: "SHARD TOTALMENTE DOWN: {{ $labels.shard }}/{{ $labels.pbc }}"
+          runbook: "runbooks/shard-failover.md"
+
+      - alert: DataSyncLagHigh
+        expr: data_sync_lag_seconds > 5
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Sync lag {{ $value }}s: {{ $labels.shard }}/{{ $labels.pbc }}"
+          runbook: "runbooks/data-sync-lag.md"
+
+      - alert: SagaFailureRateHigh
+        expr: |
+          rate(saga_completed_total{outcome="failed"}[5m])
+          / rate(saga_completed_total[5m]) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Taxa de falha de sagas > 5%"
+
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 2
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Circuit breaker aberto: {{ $labels.component }}/{{ $labels.breaker }}"
+          runbook: "runbooks/circuit-breaker.md"
+
+      - alert: ErrorBudgetBurn
+        expr: shard:error_budget_burn > 14.4
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Error budget crítico: {{ $labels.shard }}/{{ $labels.pbc }}"

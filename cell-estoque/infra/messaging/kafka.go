@@ -11,6 +11,7 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/monitoring"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
 )
 
@@ -49,6 +50,7 @@ type CommandProcessor interface {
 type Producer struct {
 	p       *kafka.Producer
 	breaker *resilience.Breaker
+	shardID string
 }
 
 func NewProducer() (*Producer, error) {
@@ -75,18 +77,21 @@ func NewProducer() (*Producer, error) {
 	return &Producer{
 		p:       p,
 		breaker: resilience.NewBreaker("cell-estoque", shardID, "kafka-producer"),
+		shardID: shardID,
 	}, nil
 }
 
 func (pr *Producer) PublishReply(topic string, reply Reply) error {
 	b, _ := json.Marshal(reply)
 	key := reply.CorrelationID.String()
-	return pr.breaker.Execute(func() error {
+	err := pr.breaker.Execute(func() error {
 		return pr.p.Produce(&kafka.Message{
 			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
 			Key:            []byte(key), Value: b,
 		}, nil)
 	})
+	monitoring.KafkaMessages.WithLabelValues("cell-estoque", pr.shardID, topic, "publish").Inc()
+	return err
 }
 
 func (pr *Producer) KafkaProducer() *kafka.Producer { return pr.p }

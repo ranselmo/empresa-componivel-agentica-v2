@@ -21,6 +21,7 @@ import (
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/cache"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/middleware"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/monitoring"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/resilience"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
@@ -172,6 +173,8 @@ func publishReply(prod *kafka.Producer, reply Reply) {
 		Key:            []byte(reply.CorrelationID.String()),
 		Value:          b,
 	}, nil)
+	shardID := os.Getenv("SHARD_ID")
+	monitoring.KafkaMessages.WithLabelValues("cell-notificacoes", shardID, topic, "publish").Inc()
 }
 
 func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *audit.Logger) {

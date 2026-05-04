@@ -1,0 +1,11 @@
+groups:
+  - name: slo.availability
+    interval: 30s
+    rules:
+      - record: shard:availability:rate5m
+        expr: |
+          sum(rate(shard_router_requests_total{role="active"}[5m])) by (shard, pbc)
+          /
+          sum(rate(shard_router_requests_total[5m])) by (shard, pbc)
+      - record: shard:error_budget_burn
+        expr: (1 - shard:availability:rate5m) / (1 - 0.999)
