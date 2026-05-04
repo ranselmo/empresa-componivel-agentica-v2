@@ -54,6 +54,8 @@ células escritas em **Go**, comunicação via **Apache Kafka**, arquitetura de 
 | PostgreSQL | 16 | Banco isolado por célula (boundary físico) |
 | pgx | v5 | Driver Go nativo para PostgreSQL |
 | Gin | v1.10 | Framework HTTP das células Go |
+| lestrrat-go/jwx | v2.0.21 | Validação JWT Bearer via JWKS (F3) |
+| golang.org/x/time | v0.5.0 | IP rate limiter — 100 req/s burst 50 (F3) |
 | Traefik | v3.0 | API Gateway — entry point único |
 | OpenTelemetry | v1.24 | Tracing distribuído entre células |
 | Jaeger | 1.52 | Backend de tracing distribuído |
@@ -289,11 +291,16 @@ empresa-componivel-agentica-v2/
 │   │   ├── pedido.go
 │   │   └── events.go
 │   ├── infra/
+│   │   ├── auth/jwt.go         # F3: JWT middleware via JWKS_URL
+│   │   ├── middleware/ratelimit.go # F3: IP rate limiter 100 req/s
+│   │   ├── audit/logger.go     # F3: audit log via Kafka (audit.events)
+│   │   ├── cache/redis.go      # F2: cache-aside Redis
 │   │   ├── db/store.go
 │   │   ├── db/query_store.go   # CQRS read model
 │   │   ├── messaging/kafka.go
 │   │   ├── messaging/producer.go
-│   │   └── messaging/dlq.go    # Dead Letter Queue
+│   │   ├── messaging/dlq.go    # Dead Letter Queue
+│   │   └── resilience/         # F1: breaker, retry, bulkhead
 │   ├── api/handlers.go
 │   └── cmd/main.go
 │
@@ -321,10 +328,14 @@ empresa-componivel-agentica-v2/
 │   ├── data-sync-lag.md
 │   └── shard-failover.md
 │
-├── infra/monitoring/
-│   ├── prometheus.yml
-│   ├── grafana-datasources.yml
-│   └── grafana-dashboards.yml
+├── infra/
+│   ├── auth/jwt.go             # F3: referência canônica JWT middleware
+│   ├── middleware/ratelimit.go # F3: referência canônica rate limiter
+│   ├── audit/logger.go         # F3: referência canônica audit log
+│   └── monitoring/
+│       ├── prometheus.yml
+│       ├── grafana-datasources.yml
+│       └── grafana-dashboards.yml
 │
 ├── fitness-functions/
 │   └── run_all.py
@@ -386,13 +397,25 @@ make fitness-check
 | F0 — Fundação | shard-router, saga-hub, data-sync, PBCs Async Request-Reply | ✅ Completo |
 | F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | ✅ Completo |
 | F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | ✅ Completo |
-| F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ⬜ Pendente |
+| F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ✅ Completo |
 | F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks | 🟡 Parcial (Runbooks) |
 | F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | 🟡 Parcial (anomaly + scaling) |
 
 ---
 
 ## Changelog
+
+### v2.4.0 — 2026-05-04
+
+**F3 — Segurança (completa)**
+
+- **JWT middleware** (`infra/auth/jwt.go`): valida Bearer token via JWKS (`github.com/lestrrat-go/jwx/v2 v2.0.21`), cache de chaves com refresh de 15min, extrai `sub` e `roles` para o contexto Gin. Aplicado em rotas de escrita: `POST /pedidos/` e `PUT /estoque/:id/repor`. Dev mode: sem `JWKS_URL` passa direto sem bloquear.
+- **IP Rate Limiter** (`infra/middleware/ratelimit.go`): `golang.org/x/time/rate` — 100 req/s com burst de 50 por IP, retorna HTTP 429. Registrado como middleware global em todas as células.
+- **SAST no CI** (`.github/workflows/fitness-functions.yml`): já presente — `govulncheck` + `gosec -severity medium` em todos os 6 módulos Go a cada push.
+- **Audit Log** (`infra/audit/logger.go`): publica eventos no tópico Kafka `audit.events` com `id`, `component`, `shard_id`, `action`, `resource_type`, `resource_id`, `actor_id` e `payload`. Integrado em `criar_pedido` (cell-pedidos), `repor_estoque` (cell-estoque) e `enviar_notificacao` (cell-notificacoes).
+- Dependências adicionadas a `cell-pedidos`, `cell-estoque`, `cell-notificacoes`: `github.com/lestrrat-go/jwx/v2 v2.0.21`, `golang.org/x/time v0.5.0`.
+
+---
 
 ### v2.3.0 — 2026-05-03
 
