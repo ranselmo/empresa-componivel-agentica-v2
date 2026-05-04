@@ -385,7 +385,7 @@ make fitness-check
 |---|---|---|
 | F0 — Fundação | shard-router, saga-hub, data-sync, PBCs Async Request-Reply | ✅ Completo |
 | F1 — Resiliência | Circuit Breaker, Retry+backoff, Bulkhead, Timeout, DLQ | ✅ Completo |
-| F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | 🟡 Parcial (k8s + CQRS) |
+| F2 — Performance | Kubernetes manifests, Redis cache, CQRS read model | ✅ Completo |
 | F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ⬜ Pendente |
 | F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks | 🟡 Parcial (Runbooks) |
 | F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | 🟡 Parcial (anomaly + scaling) |
@@ -393,6 +393,20 @@ make fitness-check
 ---
 
 ## Changelog
+
+### v2.3.0 — 2026-05-03
+
+**F2 — Performance (completa)**
+
+- **Redis cache por célula** (`infra/cache/redis.go`): package `cache` idêntico nos 3 módulos de célula — `Get`/`Set`/`Del` com JSON serialization, TTL configurável, pool de 10 conexões, degradação graciosa se Redis indisponível
+- **Wiring cache-aside em `cell-pedidos`**: `BuscarPorID` lê do cache antes do DB; `Salvar` invalida a chave após persistência; prefixo `pedidos:`, TTL 60s
+- **Wiring cache-aside em `cell-estoque`**: mesmo padrão para `Produto`; prefixo `estoque:`, TTL 60s
+- **Wiring cache-aside em `cell-notificacoes`**: `Listar` cacheia lista com chave `notificacoes:list`; `Salvar` invalida; TTL 5s (lista muda frequentemente)
+- **CQRS read model** (`infra/db/query_store.go`): `Stats()` com queries agregadas separadas do `Store` de escrita — já presente em `cell-pedidos` e `cell-estoque`; endpoints `GET /pedidos/stats` e `GET /estoque/stats`
+- **Kubernetes manifests** completos: antiAffinity (`requiredDuringSchedulingIgnoredDuringExecution`), liveness/readiness probes (`/healthz/live`, `/healthz/ready`), resource requests/limits (CPU 100m–500m, memory 64Mi–256Mi), HPA `autoscaling/v2` (min=1, max=5, CPU 70%)
+- Dependência `github.com/redis/go-redis/v9 v9.5.1` adicionada a `cell-pedidos`, `cell-estoque`, `cell-notificacoes`
+
+---
 
 ### v2.2.0 — 2026-05-03
 

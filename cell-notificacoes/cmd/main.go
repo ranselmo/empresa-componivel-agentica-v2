@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/cache"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/resilience"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -57,6 +58,7 @@ type Reply struct {
 type Store struct {
 	pool    *pgxpool.Pool
 	breaker *resilience.Breaker
+	cache   *cache.Cache
 }
 
 func newStore(ctx context.Context) (*Store, error) {
@@ -82,14 +84,20 @@ func newStore(ctx context.Context) (*Store, error) {
 		return nil, err
 	}
 	shardID := os.Getenv("SHARD_ID")
+	ca, err := cache.New("notificacoes:", 5*time.Second)
+	if err != nil {
+		slog.Warn("cache unavailable, running without cache", "err", err)
+		ca = nil
+	}
 	return &Store{
 		pool:    pool,
 		breaker: resilience.NewBreaker("cell-notificacoes", shardID, "db"),
+		cache:   ca,
 	}, nil
 }
 
 func (s *Store) Salvar(ctx context.Context, id, destID uuid.UUID, tipo, canal, conteudo string) error {
-	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+	err := resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
 		return s.breaker.Execute(func() error {
 			_, err := s.pool.Exec(ctx,
 				`INSERT INTO notificacoes (id, destinatario_id, tipo, canal, conteudo, enviado_em)
@@ -98,9 +106,20 @@ func (s *Store) Salvar(ctx context.Context, id, destID uuid.UUID, tipo, canal, c
 			return err
 		})
 	})
+	if err == nil && s.cache != nil {
+		_ = s.cache.Del(ctx, "list")
+	}
+	return err
 }
 
 func (s *Store) Listar(ctx context.Context) ([]gin.H, error) {
+	if s.cache != nil {
+		var cached []gin.H
+		if hit, _ := s.cache.Get(ctx, "list", &cached); hit {
+			return cached, nil
+		}
+	}
+
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, destinatario_id, tipo, canal, conteudo, enviado_em
 		 FROM notificacoes ORDER BY enviado_em DESC LIMIT 50`)
@@ -118,6 +137,9 @@ func (s *Store) Listar(ctx context.Context) ([]gin.H, error) {
 			"id": id, "destinatario_id": dest, "tipo": tipo,
 			"canal": canal, "conteudo": conteudo, "enviado_em": enviadoEm,
 		})
+	}
+	if s.cache != nil && result != nil {
+		_ = s.cache.Set(ctx, "list", result)
 	}
 	return result, nil
 }

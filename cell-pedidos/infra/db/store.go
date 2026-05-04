@@ -4,18 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
+	"github.com/ranselmo/poc-eci/cell-pedidos/infra/cache"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
 )
 
 type Store struct {
 	pool    *pgxpool.Pool
 	breaker *resilience.Breaker
+	cache   *cache.Cache
 }
 
 func New(ctx context.Context) (*Store, error) {
@@ -40,9 +43,15 @@ func New(ctx context.Context) (*Store, error) {
 	}
 
 	shardID := os.Getenv("SHARD_ID")
+	ca, err := cache.New("pedidos:", 60*time.Second)
+	if err != nil {
+		slog.Warn("cache unavailable, running without cache", "err", err)
+		ca = nil
+	}
 	return &Store{
 		pool:    pool,
 		breaker: resilience.NewBreaker("cell-pedidos", shardID, "db"),
+		cache:   ca,
 	}, nil
 }
 
@@ -76,7 +85,7 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Pedido) error {
 	}
 	itensJSON, _ := json.Marshal(itens)
 
-	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+	err := resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
 		return s.breaker.Execute(func() error {
 			_, err := s.pool.Exec(ctx, `
 				INSERT INTO pedidos (id, cliente_id, status, valor_total, itens, criado_em, atualizado_em)
@@ -89,13 +98,24 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Pedido) error {
 			return err
 		})
 	})
+	if err == nil && s.cache != nil {
+		_ = s.cache.Del(ctx, p.ID.String())
+	}
+	return err
 }
 
 func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, error) {
+	if s.cache != nil {
+		var p domain.Pedido
+		if hit, _ := s.cache.Get(ctx, id.String(), &p); hit {
+			return &p, nil
+		}
+	}
+
 	var (
-		pid, cid              uuid.UUID
-		status                string
-		itensRaw              []byte
+		pid, cid               uuid.UUID
+		status                 string
+		itensRaw               []byte
 		criadoEm, atualizadoEm time.Time
 	)
 	err := s.breaker.Execute(func() error {
@@ -114,11 +134,15 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, 
 		uid, _ := uuid.Parse(r.ProdutoID)
 		itens[i] = domain.ItemPedido{ProdutoID: uid, Quantidade: r.Quantidade, PrecoUnit: r.PrecoUnit}
 	}
-	return &domain.Pedido{
+	p := &domain.Pedido{
 		ID: pid, ClienteID: cid,
 		Status: domain.StatusPedido(status),
-		Itens: itens, CriadoEm: criadoEm, AtualizadoEm: atualizadoEm,
-	}, nil
+		Itens:  itens, CriadoEm: criadoEm, AtualizadoEm: atualizadoEm,
+	}
+	if s.cache != nil {
+		_ = s.cache.Set(ctx, id.String(), p)
+	}
+	return p, nil
 }
 
 func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error) {

@@ -3,18 +3,21 @@ package db
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-estoque/domain"
+	"github.com/ranselmo/poc-eci/cell-estoque/infra/cache"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
 )
 
 type Store struct {
 	pool    *pgxpool.Pool
 	breaker *resilience.Breaker
+	cache   *cache.Cache
 }
 
 func New(ctx context.Context) (*Store, error) {
@@ -33,9 +36,15 @@ func New(ctx context.Context) (*Store, error) {
 	}
 
 	shardID := os.Getenv("SHARD_ID")
+	ca, err := cache.New("estoque:", 60*time.Second)
+	if err != nil {
+		slog.Warn("cache unavailable, running without cache", "err", err)
+		ca = nil
+	}
 	return &Store{
 		pool:    pool,
 		breaker: resilience.NewBreaker("cell-estoque", shardID, "db"),
+		cache:   ca,
 	}, nil
 }
 
@@ -81,6 +90,13 @@ func (s *Store) seed(ctx context.Context) error {
 }
 
 func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Produto, error) {
+	if s.cache != nil {
+		var p domain.Produto
+		if hit, _ := s.cache.Get(ctx, id.String(), &p); hit {
+			return &p, nil
+		}
+	}
+
 	var p domain.Produto
 	err := s.breaker.Execute(func() error {
 		row := s.pool.QueryRow(ctx,
@@ -90,11 +106,14 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Produto,
 	if err != nil {
 		return nil, err
 	}
+	if s.cache != nil {
+		_ = s.cache.Set(ctx, id.String(), &p)
+	}
 	return &p, nil
 }
 
 func (s *Store) Salvar(ctx context.Context, p *domain.Produto) error {
-	return resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+	err := resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
 		return s.breaker.Execute(func() error {
 			_, err := s.pool.Exec(ctx, `
 				INSERT INTO produtos (id, nome, quantidade_disponivel, preco, atualizado_em)
@@ -106,6 +125,10 @@ func (s *Store) Salvar(ctx context.Context, p *domain.Produto) error {
 			return err
 		})
 	})
+	if err == nil && s.cache != nil {
+		_ = s.cache.Del(ctx, p.ID.String())
+	}
+	return err
 }
 
 func (s *Store) Listar(ctx context.Context) ([]*domain.Produto, error) {
