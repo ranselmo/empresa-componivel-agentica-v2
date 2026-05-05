@@ -126,6 +126,11 @@ func (o *PedidoSaga) onEstoqueReply(ctx context.Context, saga *domain.Saga, repl
 }
 
 func (o *PedidoSaga) onNotificacaoReply(ctx context.Context, saga *domain.Saga, reply domain.Reply) error {
+	// Compensation path also sends a notification; don't override the FAILED status.
+	if saga.Status == domain.StatusFailed {
+		slog.Info("saga compensation notification delivered", "saga_id", saga.ID)
+		return nil
+	}
 	saga.Status = domain.StatusCompleted
 	saga.UpdatedAt = time.Now().UTC()
 	if err := o.store.Save(ctx, saga); err != nil {

@@ -46,7 +46,7 @@ def run_ff1() -> bool:
     print("FF1 — Boundary Isolation (análise estática Go)")
     print("─" * 55)
     all_ok = True
-    for cell in BOUNDARY_RULES:
+    for cell in FORBIDDEN_IMPORTS:
         v = check_boundary(cell)
         if v:
             print(f"  FAIL {cell}")

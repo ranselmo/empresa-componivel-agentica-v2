@@ -377,9 +377,13 @@ try:
         for r in results:
             shard = r["metric"].get("shard", "?")
             pbc   = r["metric"].get("pbc", "?")
-            val   = float(r["value"][1]) * 100
-            flag  = "✓" if val >= 99.9 else "✗"
-            print(f"  {flag} {shard}/{pbc:<15} disponibilidade={val:.3f}%  (SLO: 99.9%)")
+            raw   = float(r["value"][1])
+            if raw != raw:  # NaN — sem tráfego suficiente
+                print(f"  · {shard}/{pbc:<15} disponibilidade=n/a  (sem tráfego ainda)")
+            else:
+                val  = raw * 100
+                flag = "✓" if val >= 99.9 else "✗"
+                print(f"  {flag} {shard}/{pbc:<15} disponibilidade={val:.3f}%  (SLO: 99.9%)")
 except Exception:
     print("  (Prometheus não acessível ou slo-rules ainda não avaliadas)")
 PYEOF

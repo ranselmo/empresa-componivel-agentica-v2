@@ -185,6 +185,8 @@ services:
   data-sync:
     build: ./data-sync
     networks: [poc-eci]
+    ports:
+      - "9191:9191"
     depends_on:
       kafka:
         condition: service_healthy
