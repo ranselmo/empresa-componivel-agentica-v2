@@ -418,6 +418,20 @@ docker compose up -d && ./check.sh --full
 
 ## Changelog
 
+### v2.15.0 — 2026-05-05
+
+**demo.sh atualizado para v2.14.0**
+
+- Banner atualizado: "Kafka KRaft" (ZooKeeper removido), versão e referência às 47 melhorias REFINE.md
+- Setup aguarda `/healthz/ready` do `data-sync` antes de prosseguir
+- SAGA compensação: fluxo correto exibido com `liberar_estoque` antes de FAILED (R1.2)
+- Kafka topics: coloração adicionada para `cdc.*` (CDC Debezium), `audit.*` (audit log) e `events.pedidos.falhou`
+- Pilar 2: bloco de data-sync readiness; Prometheus com queries de `data_sync_lag_seconds`, `data_sync_applied_total`, `circuit_breaker_state` e SLO de disponibilidade (`shard:availability:rate5m`)
+- Pilar 4: "12 tools: 7 cell + 5 shard-aware" corrigido (era "5 MCP tools"); `ANTHROPIC_MODEL` env var documentada
+- Resumo final: seção "Qualidade (REFINE.md)" com descrição de cada fase R1–R6
+
+---
+
 ### v2.14.0 — 2026-05-05
 
 **REFINE.md Fase R6 — Testes**
