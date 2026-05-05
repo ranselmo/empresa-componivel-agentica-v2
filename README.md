@@ -407,10 +407,43 @@ docker compose up -d && ./check.sh --full
 | F3 — Segurança | JWT middleware, Rate limiting, SAST pipeline, Audit log | ✅ Completo |
 | F4 — FinOps + SRE | SLO rules, Alert rules, Runbooks, FinOps metrics | ✅ Completo |
 | F5 — IA Avançada | Self-healing, Anomaly detection, Predictive scaling | ✅ Completo |
+| R1 — Bugs críticos | Transação atômica, compensação SAGA, at-least-once Kafka, allowlists | ✅ Completo |
+| R2 — Módulo shared/ | Elimina 18 pacotes duplicados; replace directive local | ✅ Completo |
+| R3 — Consistência | cell-notificacoes refatorado, CorrelationID separado, TTLFromEnv | ✅ Completo |
+| R4 — Observabilidade | HealthWatcher semáforo, proxy cache, SLO latência, data-sync metrics | ✅ Completo |
+| R5 — CI/CD e Infra | Cache CI, versões fixas, KRaft, PDBs, NetworkPolicies, tópicos explícitos | ✅ Completo |
+| R6 — Testes | Testes unitários de domínio e resilience, FF1/FF2 corrigidos | ✅ Completo |
 
 ---
 
 ## Changelog
+
+### v2.14.0 — 2026-05-05
+
+**REFINE.md Fase R6 — Testes**
+
+- **R6.1**: Testes unitários criados para 4 domínios: `cell-pedidos/domain/pedido_test.go` (8 casos: NewPedido válido/inválido, ValorTotal, Confirmar, Cancelar), `cell-estoque/domain/estoque_test.go` (7 casos: Reservar, Liberar, Repor), `shard-router/domain/routing_test.go` (3 casos: determinismo, formato, distribuição), `shared/resilience/retry_test.go` + `bulkhead_test.go` (7 casos). Todos passam com `-race`.
+- **R6.2**: `BOUNDARY_RULES` removida de `fitness-functions/run_all.py` — os padrões (`"estoque123"`, etc.) nunca existiam no código e o check era inócuo. `check_boundary` agora usa apenas `FORBIDDEN_IMPORTS` para verificar imports reais via `github.com/ranselmo/poc-eci/{pbc}`.
+- **R6.3**: `FF2_JWT_TOKEN` env var adicionada ao FF2 — quando definida injeta `Authorization: Bearer <token>` e ajusta `expected_status` para 201; quando ausente com `JWKS_URL` ativo espera 401 explicitamente.
+
+---
+
+### v2.13.0 — 2026-05-05
+
+**REFINE.md Fase R5 — CI/CD e Infraestrutura**
+
+- **R5.1–R5.4**: CI reescrito — `actions/cache@v4` para `~/go/pkg/mod` + `~/.cache/go-build` em todos os jobs; `govulncheck@v1.1.3` e `gosec@v2.21.4` fixados (era `@latest`); job `test` adicionado (`go test -race -count=1 ./...`); job `lint` adicionado com `golangci-lint-action@v6` v1.59.1.
+- **R5.5**: `Makefile` com targets `build-images` e `push-images` usando `VERSION=$(git describe --tags --always --dirty)` — resolve imagens `latest` nos manifests k8s.
+- **R5.6**: `k8s/core/data-sync.yaml` criado — Deployment + Service + readinessProbe em `/healthz/ready:9191`, DSNs passivos via `Secret data-sync-passive-dsns`.
+- **R5.7**: 9 `PodDisruptionBudget` (`minAvailable: 1`) criados para os 9 deployments ativos (3 shards × 3 PBCs).
+- **R5.8**: `k8s/base/network-policy.yaml` — 3 `NetworkPolicy` isolam PBCs: cada um só aceita ingress do `shard-router` e Prometheus (enforça L1 na camada de rede).
+- **R5.9**: `shared/auth/jwt.go` emite `slog.Warn` quando `JWKS_URL` não está definida — torna visível que autenticação está desabilitada em dev.
+- **R5.10–R5.12**: `ALLOWED_CONTAINERS` definida em `agent-mcp/main.py` — `reiniciar_celula` rejeita containers não listados; `subprocess.run` substituído por `asyncio.create_subprocess_exec` (não bloqueia o event loop); `ANTHROPIC_MODEL` env var (default `claude-sonnet-4-6`).
+- **R5.13**: `monitor_log` declarado como `deque[dict]` com `maxlen=100` — remove acumulação ilimitada sem pop manual.
+- **R5.14**: Kafka migrado de ZooKeeper para **KRaft** no `docker-compose.yml` — serviço `zookeeper` removido; `kafka` agora usa `KAFKA_PROCESS_ROLES: broker,controller` com `CLUSTER_ID` fixo; `KAFKA_AUTO_CREATE_TOPICS_ENABLE: false`.
+- **R5.15**: `infra/kafka/create-topics.sh` criado com todos os 30+ tópicos explícitos (commands, replies, events, audit, DLQ, CDC); serviço `kafka-init` adicionado ao `docker-compose.yml` executa o script após Kafka estar healthy.
+
+---
 
 ### v2.12.0 — 2026-05-05
 
