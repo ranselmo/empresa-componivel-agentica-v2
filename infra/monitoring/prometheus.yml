@@ -23,6 +23,9 @@ scrape_configs:
           - 'cell-pedidos-s1-active:8000'
           - 'cell-pedidos-s2-active:8000'
           - 'cell-pedidos-s3-active:8000'
+          - 'cell-pedidos-s1-passive:8000'
+          - 'cell-pedidos-s2-passive:8000'
+          - 'cell-pedidos-s3-passive:8000'
     metrics_path: /metrics
 
   - job_name: cell-estoque
@@ -31,6 +34,9 @@ scrape_configs:
           - 'cell-estoque-s1-active:8000'
           - 'cell-estoque-s2-active:8000'
           - 'cell-estoque-s3-active:8000'
+          - 'cell-estoque-s1-passive:8000'
+          - 'cell-estoque-s2-passive:8000'
+          - 'cell-estoque-s3-passive:8000'
     metrics_path: /metrics
 
   - job_name: cell-notificacoes
@@ -39,4 +45,12 @@ scrape_configs:
           - 'cell-notif-s1-active:8000'
           - 'cell-notif-s2-active:8000'
           - 'cell-notif-s3-active:8000'
+          - 'cell-notif-s1-passive:8000'
+          - 'cell-notif-s2-passive:8000'
+          - 'cell-notif-s3-passive:8000'
+    metrics_path: /metrics
+
+  - job_name: data-sync
+    static_configs:
+      - targets: ['data-sync:9191']
     metrics_path: /metrics

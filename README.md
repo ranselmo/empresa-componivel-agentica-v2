@@ -412,6 +412,20 @@ docker compose up -d && ./check.sh --full
 
 ## Changelog
 
+### v2.12.0 — 2026-05-05
+
+**REFINE.md Fase R4 — Observabilidade e runtime**
+
+- **R4.2**: `HealthWatcher` com semáforo de 5 slots — evita thundering herd de goroutines de health-check quando há muitas células
+- **R4.3**: `ReverseProxy` cacheado por `BaseURL` no handler (`proxyCache map[string]*httputil.ReverseProxy`) — evita alocação de proxy por request
+- **R4.6**: Targets passivos adicionados ao `infra/monitoring/prometheus.yml` (18 → 36 targets, incluindo as 9 células passivas e data-sync)
+- **R4.7**: `slo-rules.yml` e `alert-rules.yml` montados como volumes no `docker-compose.yml` — Prometheus agora carrega as regras em runtime
+- **R4.8**: `slo.latency` group adicionado ao `slo-rules.yml` — recording rules para `shard:latency_p99:rate5m` e detecção de breach (p99 > 500ms)
+- **R4.9**: `/healthz/ready` adicionado ao `data-sync` — retorna 503 se nenhum pool passivo estiver conectado
+- **R4.10**: `data_sync_lag_seconds` gauge por shard/pbc — emitido após cada apply bem-sucedido
+
+---
+
 ### v2.11.0 — 2026-05-05
 
 **REFINE.md Fase R3 — Consistência arquitetural**

@@ -38,20 +38,43 @@ var (
 )
 
 type Handler struct {
-	reg      *infra.Registry
-	mu       sync.Mutex
-	breakers map[string]*resilience.Breaker // keyed by pbc
+	reg        *infra.Registry
+	mu         sync.RWMutex
+	breakers   map[string]*resilience.Breaker // keyed by pbc
+	proxyCache map[string]*httputil.ReverseProxy // keyed by cell BaseURL
 }
 
 func New(reg *infra.Registry) *Handler {
 	h := &Handler{
-		reg:      reg,
-		breakers: make(map[string]*resilience.Breaker),
+		reg:        reg,
+		breakers:   make(map[string]*resilience.Breaker),
+		proxyCache: make(map[string]*httputil.ReverseProxy),
 	}
 	for _, pbc := range []string{"pedidos", "estoque", "notificacoes"} {
 		h.breakers[pbc] = resilience.NewBreaker("shard-router", "", pbc+"-proxy")
 	}
 	return h
+}
+
+func (h *Handler) getProxy(baseURL string) *httputil.ReverseProxy {
+	h.mu.RLock()
+	rp, ok := h.proxyCache[baseURL]
+	h.mu.RUnlock()
+	if ok {
+		return rp
+	}
+	target, _ := url.Parse(baseURL)
+	rp = &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+		},
+	}
+	h.mu.Lock()
+	h.proxyCache[baseURL] = rp
+	h.mu.Unlock()
+	return rp
 }
 
 func (h *Handler) Register(r *gin.Engine) {
@@ -94,23 +117,18 @@ func (h *Handler) proxy(pbc string) gin.HandlerFunc {
 		c.Request.Header.Set("X-Cell-ID", cell.ID)
 		c.Request.Header.Set("X-Cell-Role", cell.Role)
 
-		target, _ := url.Parse(cell.BaseURL)
+		rp := h.getProxy(cell.BaseURL)
+		cellID := cell.ID
 
 		proxyErr := breaker.Execute(func() error {
 			var forwardErr error
-			rp := &httputil.ReverseProxy{
-				Director: func(req *http.Request) {
-					req.URL.Scheme = target.Scheme
-					req.URL.Host = target.Host
-					req.Host = target.Host
-				},
-				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-					slog.Error("proxy error", "cell", cell.ID, "err", err)
-					forwardErr = err
-					w.WriteHeader(http.StatusBadGateway)
-				},
+			rpWithErrorHandler := *rp
+			rpWithErrorHandler.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+				slog.Error("proxy error", "cell", cellID, "err", err)
+				forwardErr = err
+				w.WriteHeader(http.StatusBadGateway)
 			}
-			rp.ServeHTTP(c.Writer, c.Request)
+			rpWithErrorHandler.ServeHTTP(c.Writer, c.Request)
 			return forwardErr
 		})
 		if proxyErr != nil {

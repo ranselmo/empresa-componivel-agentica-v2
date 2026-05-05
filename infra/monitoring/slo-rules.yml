@@ -9,3 +9,14 @@ groups:
           sum(rate(shard_router_requests_total[5m])) by (shard, pbc)
       - record: shard:error_budget_burn
         expr: (1 - shard:availability:rate5m) / (1 - 0.999)
+
+  - name: slo.latency
+    interval: 30s
+    rules:
+      - record: shard:latency_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(shard_router_duration_seconds_bucket[5m])) by (shard, pbc, le)
+          )
+      - record: shard:latency_slo_breach
+        expr: shard:latency_p99:rate5m > 0.5

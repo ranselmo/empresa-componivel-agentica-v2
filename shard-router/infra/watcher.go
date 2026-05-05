@@ -11,12 +11,14 @@ import (
 type HealthWatcher struct {
 	reg    *Registry
 	client *http.Client
+	sem    chan struct{}
 }
 
 func NewHealthWatcher(reg *Registry) *HealthWatcher {
 	return &HealthWatcher{
 		reg:    reg,
 		client: &http.Client{Timeout: 2 * time.Second},
+		sem:    make(chan struct{}, 5),
 	}
 }
 
@@ -29,7 +31,16 @@ func (w *HealthWatcher) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			for _, cell := range w.reg.Snapshot() {
-				go w.check(ctx, cell)
+				cell := cell
+				select {
+				case w.sem <- struct{}{}:
+					go func() {
+						defer func() { <-w.sem }()
+						w.check(ctx, cell)
+					}()
+				default:
+					// semaphore full — skip this tick for this cell
+				}
 			}
 		}
 	}

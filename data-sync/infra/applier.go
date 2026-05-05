@@ -51,6 +51,9 @@ var (
 	syncErr = promauto.NewCounterVec(
 		prometheus.CounterOpts{Name: "data_sync_errors_total"},
 		[]string{"shard", "pbc"})
+	syncLag = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{Name: "data_sync_lag_seconds", Help: "Seconds since last successful CDC apply"},
+		[]string{"shard", "pbc"})
 )
 
 type debeziumMsg struct {
@@ -66,9 +69,12 @@ type debeziumMsg struct {
 
 type Applier struct {
 	c        *kafka.Consumer
-	pools    map[string]*pgxpool.Pool   // "shard-1:pedidos" → pool da passiva
-	breakers map[string]*resilience.Breaker // mesma chave
+	pools    map[string]*pgxpool.Pool        // "shard-1:pedidos" → pool da passiva
+	breakers map[string]*resilience.Breaker  // mesma chave
+	lastApply map[string]time.Time            // last successful apply per key
 }
+
+func (a *Applier) PoolCount() int { return len(a.pools) }
 
 func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -121,7 +127,7 @@ func NewApplier(passiveDSNs map[string]string) (*Applier, error) {
 		pools[key] = pool
 		breakers[key] = resilience.NewBreaker("data-sync", key, "db-passive")
 	}
-	return &Applier{c: c, pools: pools, breakers: breakers}, nil
+	return &Applier{c: c, pools: pools, breakers: breakers, lastApply: make(map[string]time.Time)}, nil
 }
 
 func (a *Applier) Run(ctx context.Context) {
@@ -198,6 +204,8 @@ func (a *Applier) apply(ctx context.Context, msg *kafka.Message) {
 		return
 	}
 	applied.WithLabelValues(shard, pbc, dm.Payload.Op).Inc()
+	a.lastApply[key] = time.Now()
+	syncLag.WithLabelValues(shard, pbc).Set(0)
 }
 
 func applyWithResilience(ctx context.Context, breaker *resilience.Breaker, fn func() error) error {

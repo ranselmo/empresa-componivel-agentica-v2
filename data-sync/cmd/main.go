@@ -50,6 +50,13 @@ func main() {
 	mux.HandleFunc("/healthz/live", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
+	mux.HandleFunc("/healthz/ready", func(w http.ResponseWriter, r *http.Request) {
+		if app.PoolCount() == 0 {
+			w.WriteHeader(503)
+			return
+		}
+		w.WriteHeader(200)
+	})
 	srv := &http.Server{Addr: ":9191", Handler: mux}
 	go func() { _ = srv.ListenAndServe() }()
 
