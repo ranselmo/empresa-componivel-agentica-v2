@@ -83,11 +83,12 @@ clear
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║   PoC — Empresa Componível Inteligente (ECI v2)     ║"
-echo "  ║   Go 1.22 · Apache Kafka · 3 Shards · Agent MCP    ║"
+echo "  ║   Go 1.22 · Kafka KRaft · 3 Shards · Agent MCP     ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 info "Autor: Rafael Sá Anselmo"
-info "Stack: Go 1.22 · Kafka · PostgreSQL · Redis · Prometheus · Jaeger · Claude"
+info "Stack: Go 1.22 · Kafka KRaft · PostgreSQL · Redis · Prometheus · Jaeger · Claude"
+info "v2.14.0 — REFINE.md fases R1–R6 completas (47 melhorias implementadas)"
 nl
 
 # ── START STACK ───────────────────────────────────────────────────────────────
@@ -107,6 +108,10 @@ wait_healthy "$ROUTER/healthz/live" "shard-router:8080/healthz/live ..." 200 || 
   info "Para diagnóstico: docker compose logs shard-router"
   exit 1
 }
+
+# Aguarda data-sync estar pronto (pools passivos conectados)
+wait_healthy "http://localhost:9191/healthz/ready" "data-sync:9191/healthz/ready ..." 60 || \
+  info "data-sync não ficou pronto — CDC passivo pode estar indisponível"
 
 # Aguarda pelo menos 9 células registradas como saudáveis
 step "Aguardando health watcher registrar células ativas (até 60s)..."
@@ -159,9 +164,11 @@ for p in json.load(sys.stdin):
 nl
 
 # ── SAGA Happy Path ───────────────────────────────────────────────────────────
-header "PILAR 1 — SAGA Coreografada via Kafka (Happy Path)"
-info "Fluxo: POST /saga/pedido → saga-hub → Kafka → cell-pedidos"
-info "       → cell-estoque (reserva) → cell-notificacoes → COMPLETED"
+header "PILAR 1 — SAGA Orquestrada via Kafka (Happy Path)"
+info "Fluxo: POST /saga/pedido → saga-hub → commands.pedidos.criar"
+info "       → replies.pedidos.criado → commands.estoque.reservar"
+info "       → replies.estoque.reservado → commands.notificacoes.enviar"
+info "       → replies.notificacoes.enviada → status=COMPLETED"
 nl
 
 step "Iniciando SAGA: Notebook Pro (estoque=10) — espera COMPLETED..."
@@ -197,16 +204,18 @@ else
 import sys, json
 s = json.load(sys.stdin)
 print(f'  saga_id={s[\"saga_id\"]}')
+print(f'  correlation_id={s.get(\"correlation_id\", \"(campo na saga interna)\")}')
 print(f'  step={s[\"current_step\"]}  shard={s[\"shard_id\"]}')
 " 2>/dev/null
 fi
 nl
 
 # ── SAGA Compensação ──────────────────────────────────────────────────────────
-header "PILAR 1 — SAGA via Kafka (Compensação por Estoque Insuficiente)"
-info "Fluxo: cell-estoque devolve EstoqueInsuficiente → saga-hub"
-info "       → [commands.pedidos.cancelar] → [commands.notificacoes.enviar]"
-info "       → status=FAILED (compensação bem-sucedida)"
+header "PILAR 1 — SAGA via Kafka (Compensação Completa por Estoque Insuficiente)"
+info "Fluxo: commands.estoque.reservar → EstoqueInsuficiente → saga-hub"
+info "       → commands.pedidos.cancelar → replies.pedidos.cancelado"
+info "       → commands.estoque.liberar  → replies.estoque.liberado   (R1.2)"
+info "       → commands.notificacoes.enviar → status=FAILED"
 nl
 
 step "Iniciando SAGA: Monitor 4K (estoque=0) — espera FAILED..."
@@ -230,11 +239,11 @@ if [ -z "$SAGA2_ID" ]; then
   err "Falha ao iniciar SAGA — resposta: $SAGA2"
 else
   ok "SAGA iniciada — id=$SAGA2_ID"
-  printf "  Aguardando compensação Kafka"
+  printf "  Aguardando compensação Kafka (cancelar → liberar_estoque → notificar)"
   STATUS2=$(poll_saga "$SAGA2_ID" 120)
   echo
   [ "$STATUS2" = "FAILED" ] \
-    && ok "Compensação bem-sucedida — status=FAILED ✓ (estoque insuficiente compensado)" \
+    && ok "Compensação completa — status=FAILED ✓ (estoque reservado liberado antes de falhar)" \
     || err "SAGA status=$STATUS2 (esperava FAILED)"
 fi
 nl
@@ -262,7 +271,7 @@ print(f'  total={s.get(\"total\",0)}  pendentes={s.get(\"pendentes\",0)}  confir
 nl
 
 # ── Kafka Topics ──────────────────────────────────────────────────────────────
-header "PILAR 1 — Tópicos Kafka (Event Bus Durável)"
+header "PILAR 1 — Tópicos Kafka (KRaft — criação explícita via kafka-init)"
 step "Tópicos criados no cluster poc-eci:"
 docker compose exec -T kafka kafka-topics \
   --bootstrap-server kafka:29092 --list 2>/dev/null \
@@ -272,6 +281,8 @@ docker compose exec -T kafka kafka-topics \
       commands.*) printf "  \033[33m→ cmd\033[0m  %s\n" "$t" ;;
       replies.*)  printf "  \033[32m← rep\033[0m  %s\n" "$t" ;;
       events.*)   printf "  \033[36m◉ evt\033[0m  %s\n" "$t" ;;
+      cdc.*)      printf "  \033[35m↓ cdc\033[0m  %s\n" "$t" ;;
+      audit.*)    printf "  \033[34m✎ aud\033[0m  %s\n" "$t" ;;
       dlq.*)      printf "  \033[31m☓ dlq\033[0m  %s\n" "$t" ;;
       *)          printf "  · sys  %s\n" "$t" ;;
     esac
@@ -298,30 +309,6 @@ ok "Grafana (dashboards):       $GRAFANA  (admin / poc123)"
 ok "Agent MCP (Swagger UI):     $AGENT/docs"
 nl
 
-step "Contadores Prometheus (via scrape das células Go):"
-python3 3>/dev/null <<'PYEOF'
-import urllib.request, json, urllib.parse, sys
-
-PROMETHEUS = "http://localhost:9095"
-queries = [
-    ("shard_router_requests_total",  "Requests via shard-router"),
-    ("shard_router_failover_total",  "Failovers ativo → passivo"),
-    ("saga_started_total",           "SAGAs iniciadas"),
-    ("saga_completed_total",         "SAGAs completadas/compensadas"),
-]
-for q, label in queries:
-    try:
-        url = f"{PROMETHEUS}/api/v1/query?query={urllib.parse.quote(q)}"
-        with urllib.request.urlopen(url, timeout=4) as r:
-            data = json.loads(r.read())
-        results = data.get("data", {}).get("result", [])
-        total   = sum(float(r["value"][1]) for r in results) if results else 0
-        print(f"  {label:<40} = {total:.0f}")
-    except Exception as e:
-        print(f"  {label:<40} = (ainda scraping)")
-PYEOF
-nl
-
 step "Health consolidado pelo shard-router:"
 curl -sf "$ROUTER/router/cells" | python3 -c "
 import sys, json
@@ -330,10 +317,72 @@ saudaveis = sum(1 for c in cells if c['Healthy'])
 total     = len(cells)
 print(f'  {saudaveis}/{total} células saudáveis')
 for pbc in ['pedidos', 'estoque', 'notificacoes']:
-    ativos   = [c for c in cells if c['PBC'] == pbc and c['Role'] == 'active'   and c['Healthy']]
-    passivos = [c for c in cells if c['PBC'] == pbc and c['Role'] == 'passive'  and c['Healthy']]
+    ativos   = [c for c in cells if c['PBC'] == pbc and c['Role'] == 'active'  and c['Healthy']]
+    passivos = [c for c in cells if c['PBC'] == pbc and c['Role'] == 'passive' and c['Healthy']]
     print(f'  {pbc:<15} active={len(ativos)}/3  passive={len(passivos)}/3')
 " 2>/dev/null
+nl
+
+step "data-sync (CDC ativo→passivo) — readiness:"
+DATA_SYNC_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:9191/healthz/ready" 2>/dev/null || echo "000")
+if [ "$DATA_SYNC_STATUS" = "200" ]; then
+  ok "data-sync pronto — pools passivos conectados (HTTP 200)"
+elif [ "$DATA_SYNC_STATUS" = "503" ]; then
+  err "data-sync degradado — nenhum pool passivo conectado (HTTP 503)"
+else
+  info "data-sync não acessível na porta 9191 (status=$DATA_SYNC_STATUS)"
+fi
+nl
+
+step "Contadores Prometheus (via scrape das células Go):"
+python3 3>/dev/null <<'PYEOF'
+import urllib.request, json, urllib.parse, sys
+
+PROMETHEUS = "http://localhost:9095"
+queries = [
+    ("shard_router_requests_total",                 "Requests via shard-router"),
+    ("shard_router_failover_total",                 "Failovers ativo → passivo"),
+    ("saga_started_total",                          "SAGAs iniciadas"),
+    ("saga_completed_total",                        "SAGAs completadas/compensadas"),
+    ("data_sync_applied_total",                     "CDC events aplicados (data-sync)"),
+    ("data_sync_lag_seconds",                       "Lag CDC atual (segundos)"),
+    ("circuit_breaker_state",                       "Circuit breakers abertos (estado=2)"),
+]
+for q, label in queries:
+    try:
+        url = f"{PROMETHEUS}/api/v1/query?query={urllib.parse.quote(q)}"
+        with urllib.request.urlopen(url, timeout=4) as r:
+            data = json.loads(r.read())
+        results = data.get("data", {}).get("result", [])
+        total   = sum(float(r["value"][1]) for r in results) if results else 0
+        print(f"  {label:<45} = {total:.0f}")
+    except Exception:
+        print(f"  {label:<45} = (ainda scraping)")
+PYEOF
+nl
+
+step "SLO — Disponibilidade (shard:availability:rate5m):"
+python3 3>/dev/null <<'PYEOF'
+import urllib.request, json, urllib.parse
+
+PROMETHEUS = "http://localhost:9095"
+try:
+    url = f"{PROMETHEUS}/api/v1/query?query={urllib.parse.quote('shard:availability:rate5m')}"
+    with urllib.request.urlopen(url, timeout=4) as r:
+        data = json.loads(r.read())
+    results = data.get("data", {}).get("result", [])
+    if not results:
+        print("  (aguardando dados suficientes para calcular SLO)")
+    else:
+        for r in results:
+            shard = r["metric"].get("shard", "?")
+            pbc   = r["metric"].get("pbc", "?")
+            val   = float(r["value"][1]) * 100
+            flag  = "✓" if val >= 99.9 else "✗"
+            print(f"  {flag} {shard}/{pbc:<15} disponibilidade={val:.3f}%  (SLO: 99.9%)")
+except Exception:
+    print("  (Prometheus não acessível ou slo-rules ainda não avaliadas)")
+PYEOF
 nl
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,19 +405,27 @@ nl
 header "PILAR 4 — IA Agêntica com MCP (Claude + Anthropic SDK)"
 
 if wait_healthy "$AGENT/health" "agent-mcp:9000/health ..." 20 2>/dev/null; then
-  step "Tools MCP disponíveis (acessam células Go via HTTP):"
+  step "Tools MCP disponíveis (12 tools: 7 cell + 5 shard-aware):"
   curl -sf "$AGENT/agente/tools" 2>/dev/null | python3 -c "
 import sys, json
-for t in json.load(sys.stdin).get('tools', []):
-    print(f'  · {t[\"name\"]:<28} {t[\"description\"][:55]}')
+tools = json.load(sys.stdin).get('tools', [])
+mcp   = [t for t in tools if t['name'] not in {'listar_status_shards','verificar_saga','iniciar_saga_pedido','reiniciar_celula','consultar_prometheus'}]
+shard = [t for t in tools if t['name'] in {'listar_status_shards','verificar_saga','iniciar_saga_pedido','reiniciar_celula','consultar_prometheus'}]
+print(f'  MCP tools ({len(mcp)}):')
+for t in mcp:
+    print(f'    · {t[\"name\"]:<28} {t[\"description\"][:50]}')
+print(f'  Shard-aware tools ({len(shard)}):')
+for t in shard:
+    print(f'    · {t[\"name\"]:<28} {t[\"description\"][:50]}')
 " 2>/dev/null
   nl
 
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    step "Consultando agente Claude (diagnosticar estado do sistema)..."
+    MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-6}"
+    step "Consultando agente Claude ($MODEL) — diagnosticar estado do sistema..."
     AGENT_RESP=$(curl -sf -X POST "$AGENT/agente/executar" \
       -H "Content-Type: application/json" \
-      -d '{"prompt":"Verifique a saúde das células via router/cells e resuma os pedidos criados. Seja breve."}' \
+      -d '{"prompt":"Verifique a saúde das células via listar_status_shards e resuma os pedidos criados. Seja breve."}' \
       2>/dev/null || echo '{"resultado":"(timeout)"}')
     echo "$AGENT_RESP" | python3 -c \
       "import sys,json; print(json.load(sys.stdin).get('resultado',''))" 2>/dev/null
@@ -393,10 +450,11 @@ else:
     print(f'  {flag}  score={r.get(\"score\",\"N/A\")}')
 " 2>/dev/null
   else
-    info "ANTHROPIC_API_KEY não configurada — agente em modo passivo (loop de monitoramento desabilitado)"
+    info "ANTHROPIC_API_KEY não configurada — agente em modo passivo"
     info ""
     info "Para ativar o agente IA:"
     info "  export ANTHROPIC_API_KEY=sk-ant-..."
+    info "  export ANTHROPIC_MODEL=claude-sonnet-4-6  # opcional"
     info "  docker compose restart agent-mcp"
     info "  ./demo.sh"
     info ""
@@ -410,29 +468,38 @@ nl
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESUMO FINAL
 # ═══════════════════════════════════════════════════════════════════════════════
-header "Demo Concluída — ECI v2"
+header "Demo Concluída — ECI v2 (v2.14.0)"
 
-ok "PILAR 1 — 3 PBCs em Go | 3 shards × (active+passive) | SAGA coreografada via Kafka"
-ok "PILAR 2 — Shard Router (consistent hash) | OTel→Jaeger | Prometheus/Grafana"
+ok "PILAR 1 — 3 PBCs em Go | 3 shards × (active+passive) | SAGA orquestrada via Kafka"
+ok "PILAR 2 — Shard Router (consistent hash) | OTel→Jaeger | Prometheus/Grafana | SLO"
 ok "PILAR 3 — FF1 Boundary | FF2 Contract | FF3 p99 Latência | FF4 Chaos Bulkhead"
-ok "PILAR 4 — Claude Sonnet + 5 MCP tools | IsolationForest | EMA Predictor"
+ok "PILAR 4 — Claude + 12 MCP tools | IsolationForest | EMA Predictor | ANTHROPIC_MODEL"
 nl
 
 echo -e "  ${BOLD}Leis Arquiteturais:${NC}"
 info "  L1: PBCs são ilhas — sem imports/HTTP cross-PBC          (verificado: FF1)"
-info "  L2: saga-hub é o único integrador entre PBCs             (Kafka coreography)"
+info "  L2: saga-hub é o único integrador entre PBCs             (Kafka orquestration)"
 info "  L3: toda requisição entra pelo shard-router:8080         (consistent hash)"
 info "  L4: células passivas recusam escrita HTTP 503            (CELL_ROLE=passive)"
 info "  L5: Scale Unit = 1 célula + 1 DB + 1 Redis + 1 group    (docker-compose)"
 nl
 
+echo -e "  ${BOLD}Qualidade (REFINE.md — 47 melhorias):${NC}"
+info "  R1: bugs críticos corrigidos — transação atômica, compensação SAGA, at-least-once"
+info "  R2: módulo shared/ — elimina 18 pacotes duplicados entre os 6 componentes Go"
+info "  R3: consistência arquitetural — cell-notificacoes, CorrelationID separado"
+info "  R4: observabilidade — watcher semáforo, proxy cache, SLO latência, data-sync lag"
+info "  R5: CI/CD — Kafka KRaft, PDB, NetworkPolicy, tópicos explícitos, versões fixas"
+info "  R6: testes — 25 casos unitários de domínio e resilience, FF1/FF2 corrigidos"
+nl
+
 echo -e "  ${BOLD}Interfaces:${NC}"
-printf "  %-10s %s\n" "Router:"     "$ROUTER/router/cells"
-printf "  %-10s %s\n" "Kafka UI:"   "$KAFKA_UI"
-printf "  %-10s %s\n" "Jaeger:"     "$JAEGER"
-printf "  %-10s %s\n" "Grafana:"    "$GRAFANA  (admin/poc123)"
-printf "  %-10s %s\n" "Prometheus:" "$PROMETHEUS"
-printf "  %-10s %s\n" "Agent MCP:"  "$AGENT/docs"
+printf "  %-12s %s\n" "Router:"     "$ROUTER/router/cells"
+printf "  %-12s %s\n" "Kafka UI:"   "$KAFKA_UI"
+printf "  %-12s %s\n" "Jaeger:"     "$JAEGER"
+printf "  %-12s %s\n" "Grafana:"    "$GRAFANA  (admin/poc123)"
+printf "  %-12s %s\n" "Prometheus:" "$PROMETHEUS"
+printf "  %-12s %s\n" "Agent MCP:"  "$AGENT/docs"
 nl
 echo -e "  ${BOLD}Comandos úteis:${NC}"
 info "  make kafka-topics"
