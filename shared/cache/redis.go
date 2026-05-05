@@ -5,10 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// TTLFromEnv reads CACHE_TTL_SECONDS and returns it as a duration, falling back to def.
+func TTLFromEnv(def time.Duration) time.Duration {
+	if s := os.Getenv("CACHE_TTL_SECONDS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
 
 type Cache struct {
 	c      *redis.Client

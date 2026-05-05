@@ -2,27 +2,19 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/ranselmo/poc-eci/shared/audit"
-	"github.com/ranselmo/poc-eci/shared/cache"
+	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/db"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
+	"github.com/ranselmo/poc-eci/shared/audit"
 	"github.com/ranselmo/poc-eci/shared/middleware"
-	"github.com/ranselmo/poc-eci/shared/monitoring"
-	"github.com/ranselmo/poc-eci/shared/resilience"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -30,275 +22,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
-
-const (
-	TopicCmdEnviar    = "commands.notificacoes.enviar"
-	TopicReplyEnviada = "replies.notificacoes.enviada"
-	TopicEventEnviada = "events.notificacoes.enviada"
-)
-
-type Command struct {
-	CommandID     uuid.UUID      `json:"command_id"`
-	CorrelationID uuid.UUID      `json:"correlation_id"`
-	SagaID        uuid.UUID      `json:"saga_id"`
-	ShardID       string         `json:"shard_id"`
-	CommandType   string         `json:"command_type"`
-	Payload       map[string]any `json:"payload"`
-	IssuedAt      time.Time      `json:"issued_at"`
-}
-
-type Reply struct {
-	ReplyID       uuid.UUID      `json:"reply_id"`
-	CorrelationID uuid.UUID      `json:"correlation_id"`
-	SagaID        uuid.UUID      `json:"saga_id"`
-	CommandType   string         `json:"command_type"`
-	Status        string         `json:"status"`
-	Payload       map[string]any `json:"payload"`
-	Error         string         `json:"error,omitempty"`
-	RepliedAt     time.Time      `json:"replied_at"`
-}
-
-type Store struct {
-	pool    *pgxpool.Pool
-	breaker *resilience.Breaker
-	cache   *cache.Cache
-}
-
-func newStore(ctx context.Context) (*Store, error) {
-	dsn := os.Getenv("DATABASE_URL")
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS notificacoes (
-			id              UUID PRIMARY KEY,
-			destinatario_id UUID NOT NULL,
-			tipo            TEXT NOT NULL,
-			canal           TEXT NOT NULL,
-			conteudo        TEXT NOT NULL,
-			enviado_em      TIMESTAMPTZ NOT NULL
-		);
-	`)
-	if err != nil {
-		return nil, err
-	}
-	shardID := os.Getenv("SHARD_ID")
-	ca, err := cache.New("notificacoes:", 5*time.Second)
-	if err != nil {
-		slog.Warn("cache unavailable, running without cache", "err", err)
-		ca = nil
-	}
-	return &Store{
-		pool:    pool,
-		breaker: resilience.NewBreaker("cell-notificacoes", shardID, "db"),
-		cache:   ca,
-	}, nil
-}
-
-func (s *Store) Salvar(ctx context.Context, id, destID uuid.UUID, tipo, canal, conteudo string) error {
-	err := resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
-		return s.breaker.Execute(func() error {
-			_, err := s.pool.Exec(ctx,
-				`INSERT INTO notificacoes (id, destinatario_id, tipo, canal, conteudo, enviado_em)
-				 VALUES ($1,$2,$3,$4,$5,$6)`,
-				id, destID, tipo, canal, conteudo, time.Now().UTC())
-			return err
-		})
-	})
-	if err == nil && s.cache != nil {
-		_ = s.cache.Del(ctx, "list")
-	}
-	return err
-}
-
-func (s *Store) Listar(ctx context.Context) ([]gin.H, error) {
-	if s.cache != nil {
-		var cached []gin.H
-		if hit, _ := s.cache.Get(ctx, "list", &cached); hit {
-			return cached, nil
-		}
-	}
-
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, destinatario_id, tipo, canal, conteudo, enviado_em
-		 FROM notificacoes ORDER BY enviado_em DESC LIMIT 50`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []gin.H
-	for rows.Next() {
-		var id, dest uuid.UUID
-		var tipo, canal, conteudo string
-		var enviadoEm time.Time
-		_ = rows.Scan(&id, &dest, &tipo, &canal, &conteudo, &enviadoEm)
-		result = append(result, gin.H{
-			"id": id, "destinatario_id": dest, "tipo": tipo,
-			"canal": canal, "conteudo": conteudo, "enviado_em": enviadoEm,
-		})
-	}
-	if s.cache != nil && result != nil {
-		_ = s.cache.Set(ctx, "list", result)
-	}
-	return result, nil
-}
-
-func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
-func (s *Store) Close()                         { s.pool.Close() }
-
-func kafkaBrokers() string {
-	b := os.Getenv("KAFKA_BROKERS")
-	if b == "" {
-		return "kafka:29092"
-	}
-	return b
-}
-
-func newProducer() (*kafka.Producer, error) {
-	return kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": kafkaBrokers(),
-		"acks":              "all",
-	})
-}
-
-func publishReply(prod *kafka.Producer, reply Reply) {
-	b, _ := json.Marshal(reply)
-	topic := TopicReplyEnviada
-	_ = prod.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(reply.CorrelationID.String()),
-		Value:          b,
-	}, nil)
-	shardID := os.Getenv("SHARD_ID")
-	monitoring.KafkaMessages.WithLabelValues("cell-notificacoes", shardID, topic, "publish").Inc()
-}
-
-func runConsumer(ctx context.Context, store *Store, prod *kafka.Producer, al *audit.Logger) {
-	shardID := os.Getenv("SHARD_ID")
-	cellRole := os.Getenv("CELL_ROLE")
-
-	if cellRole == "passive" {
-		slog.Info("passive cell — command consumer disabled", "shard", shardID)
-		<-ctx.Done()
-		return
-	}
-
-	groupID := fmt.Sprintf("cell-notificacoes-%s-%s-cmd", shardID, cellRole)
-	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":        kafkaBrokers(),
-		"group.id":                 groupID,
-		"auto.offset.reset":        "earliest",
-		"enable.auto.commit":       false,
-		"enable.auto.offset.store": false,
-	})
-	if err != nil {
-		slog.Error("kafka consumer", "err", err)
-		return
-	}
-	defer c.Close()
-	_ = c.SubscribeTopics([]string{TopicCmdEnviar}, nil)
-	slog.Info("command consumer started", "group", groupID)
-
-	bh := resilience.NewBulkhead("cell-notificacoes", shardID, "cmd-processor", 10)
-	failCounts := make(map[string]int)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			msg, err := c.ReadMessage(200)
-			if err != nil {
-				kafkaErr, ok := err.(kafka.Error)
-				if !ok || kafkaErr.Code() != kafka.ErrTimedOut {
-					slog.Error("read", "err", err)
-				}
-				continue
-			}
-			var cmd Command
-			if err := json.Unmarshal(msg.Value, &cmd); err != nil {
-				slog.Error("unmarshal cmd", "err", err)
-				if _, cErr := c.CommitMessage(msg); cErr != nil {
-					slog.Error("commit offset", "err", cErr)
-				}
-				continue
-			}
-
-			err = bh.Do(ctx, func() error {
-				return processCmd(ctx, store, prod, al, cmd)
-			})
-
-			if err != nil {
-				if strings.Contains(err.Error(), "capacity exceeded") {
-					slog.Warn("bulkhead rejected command", "type", cmd.CommandType)
-					continue
-				}
-				key := fmt.Sprintf("%d:%d", msg.TopicPartition.Partition, msg.TopicPartition.Offset)
-				failCounts[key]++
-				if failCounts[key] >= 3 {
-					messaging.SendToDLQ(prod, "notificacoes", *msg.TopicPartition.Topic,
-						string(msg.Key), msg.Value, err, failCounts[key])
-					slog.Warn("sent to DLQ", "topic", *msg.TopicPartition.Topic, "attempts", failCounts[key])
-					delete(failCounts, key)
-					if _, cErr := c.CommitMessage(msg); cErr != nil {
-						slog.Error("commit offset", "err", cErr)
-					}
-				}
-			} else {
-				delete(failCounts, fmt.Sprintf("%d:%d", msg.TopicPartition.Partition, msg.TopicPartition.Offset))
-				if _, cErr := c.CommitMessage(msg); cErr != nil {
-					slog.Error("commit offset", "err", cErr)
-				}
-			}
-		}
-	}
-}
-
-func processCmd(ctx context.Context, store *Store, prod *kafka.Producer, al *audit.Logger, cmd Command) error {
-	clienteIDStr := fmt.Sprintf("%v", cmd.Payload["cliente_id"])
-	destID, _ := uuid.Parse(clienteIDStr)
-	tipo, _ := cmd.Payload["tipo"].(string)
-	if tipo == "" {
-		tipo = "NOTIFICACAO"
-	}
-
-	conteudo := fmt.Sprintf("Notificação tipo=%s para cliente=%s", tipo, clienteIDStr)
-	notifID := uuid.New()
-
-	slog.Info("enviando notificação", "tipo", tipo, "destinatario", destID)
-	if err := store.Salvar(ctx, notifID, destID, tipo, "email", conteudo); err != nil {
-		slog.Error("salvar notificacao", "err", err)
-		al.Log(ctx, "enviar_notificacao_falhou", "notificacao", notifID.String(),
-			clienteIDStr, map[string]any{"tipo": tipo, "erro": err.Error()})
-		publishReply(prod, Reply{
-			ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
-			SagaID: cmd.SagaID, CommandType: cmd.CommandType,
-			Status: "failure", Error: err.Error(), RepliedAt: time.Now().UTC(),
-		})
-		return err
-	}
-
-	al.Log(ctx, "enviar_notificacao", "notificacao", notifID.String(),
-		clienteIDStr, map[string]any{"tipo": tipo, "canal": "email"})
-	publishReply(prod, Reply{
-		ReplyID: uuid.New(), CorrelationID: cmd.CorrelationID,
-		SagaID: cmd.SagaID, CommandType: cmd.CommandType,
-		Status: "success", RepliedAt: time.Now().UTC(),
-		Payload: map[string]any{"notificacao_id": notifID.String()},
-	})
-
-	evTopic := TopicEventEnviada
-	ev, _ := json.Marshal(map[string]any{
-		"event_id": uuid.New().String(), "tipo": tipo,
-		"destinatario_id": destID.String(), "occurred_at": time.Now().UTC(),
-	})
-	_ = prod.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &evTopic, Partition: kafka.PartitionAny},
-		Value:          ev,
-	}, nil)
-	return nil
-}
 
 func setupOTel(ctx context.Context) func() {
 	svcName := os.Getenv("OTEL_SERVICE_NAME")
@@ -330,23 +53,27 @@ func main() {
 	shardID := os.Getenv("SHARD_ID")
 	cellRole := os.Getenv("CELL_ROLE")
 
-	store, err := newStore(ctx)
+	store, err := db.New(ctx)
 	if err != nil {
 		slog.Error("db", "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	prod, err := newProducer()
+	prod, err := messaging.NewProducer()
 	if err != nil {
 		slog.Error("kafka producer", "err", err)
 		os.Exit(1)
 	}
-	defer func() { prod.Flush(5000); prod.Close() }()
+	defer prod.Close()
 
-	al := audit.New("cell-notificacoes", shardID, prod)
-
-	go runConsumer(ctx, store, prod, al)
+	al := audit.New("cell-notificacoes", shardID, prod.KafkaProducer())
+	cons, err := messaging.NewConsumer(store, prod, al)
+	if err != nil {
+		slog.Error("kafka consumer", "err", err)
+		os.Exit(1)
+	}
+	go cons.Run(ctx)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), otelgin.Middleware("cell-notificacoes"), middleware.RateLimit())
@@ -402,7 +129,9 @@ func main() {
 	srv := &http.Server{Addr: ":" + port, Handler: r}
 	go func() {
 		slog.Info("cell-notificacoes listening", "port", port, "shard", shardID, "role", cellRole)
-		_ = srv.ListenAndServe()
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server", "err", err)
+		}
 	}()
 
 	sig := make(chan os.Signal, 1)

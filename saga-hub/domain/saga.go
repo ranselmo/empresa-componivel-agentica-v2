@@ -57,10 +57,9 @@ type Saga struct {
 }
 
 func NewSaga(clienteID uuid.UUID, shardID string, payload map[string]any) *Saga {
-	id := uuid.New()
 	now := time.Now().UTC()
 	return &Saga{
-		ID: id, CorrelationID: id,
+		ID: uuid.New(), CorrelationID: uuid.New(),
 		Status: StatusStarted, CurrentStep: StepCriarPedido,
 		ClienteID: clienteID, ShardID: shardID, Payload: payload,
 		CreatedAt: now, UpdatedAt: now,

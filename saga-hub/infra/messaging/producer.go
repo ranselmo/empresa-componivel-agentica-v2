@@ -64,11 +64,15 @@ func (pr *Producer) PublishBusinessEvent(topic string, ev domain.BusinessEvent) 
 		return
 	}
 	key := ev.EventID.String()
-	_ = pr.p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(key),
-		Value:          b,
-	}, nil)
+	if err := pr.breaker.Execute(func() error {
+		return pr.p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(key),
+			Value:          b,
+		}, nil)
+	}); err != nil {
+		slog.Error("publish business event", "topic", topic, "err", err)
+	}
 }
 
 func (pr *Producer) Flush() { pr.p.Flush(5000) }

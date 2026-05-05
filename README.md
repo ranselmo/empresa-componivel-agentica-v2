@@ -412,6 +412,17 @@ docker compose up -d && ./check.sh --full
 
 ## Changelog
 
+### v2.11.0 — 2026-05-05
+
+**REFINE.md Fase R3 — Consistência arquitetural**
+
+- **R3.1**: `cell-notificacoes` refatorado do god-file para estrutura canônica: `domain/notificacao.go` (entidade pura), `infra/db/store.go` (Store tipado com domínio), `infra/messaging/kafka.go` (Consumer com bulkhead+DLQ+at-least-once) e `infra/messaging/producer.go` (Producer com breaker). `cmd/main.go` agora é bootstrap puro (~100 linhas)
+- **R3.4**: `NewSaga` gera `ID` e `CorrelationID` como UUIDs independentes — separa identidade da saga do ID de correlação de mensagens
+- **R3.6**: `PublishBusinessEvent` em `saga-hub` agora usa circuit breaker — falhas de publicação logadas em vez de silenciadas
+- **R3.7**: `cache.TTLFromEnv(def)` adicionado ao `shared/cache` — lê `CACHE_TTL_SECONDS` para override operacional sem rebuild
+
+---
+
 ### v2.10.0 — 2026-05-05
 
 **REFINE.md Fase R2 — Módulo `shared/` (elimina 18 pacotes duplicados)**

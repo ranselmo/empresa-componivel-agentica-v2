@@ -35,7 +35,7 @@ func New(ctx context.Context) (*Store, error) {
 	}
 
 	shardID := os.Getenv("SHARD_ID")
-	ca, err := cache.New("estoque:", 60*time.Second)
+	ca, err := cache.New("estoque:", cache.TTLFromEnv(60*time.Second))
 	if err != nil {
 		slog.Warn("cache unavailable, running without cache", "err", err)
 		ca = nil
