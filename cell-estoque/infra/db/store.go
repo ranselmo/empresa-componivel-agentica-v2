@@ -10,9 +10,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ranselmo/poc-eci/cell-estoque/domain"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/cache"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/monitoring"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
+	"github.com/ranselmo/poc-eci/shared/cache"
+	"github.com/ranselmo/poc-eci/shared/monitoring"
+	"github.com/ranselmo/poc-eci/shared/resilience"
 )
 
 type Store struct {

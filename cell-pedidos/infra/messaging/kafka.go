@@ -11,7 +11,7 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
-	"github.com/ranselmo/poc-eci/cell-pedidos/infra/resilience"
+	"github.com/ranselmo/poc-eci/shared/resilience"
 )
 
 type Command struct {

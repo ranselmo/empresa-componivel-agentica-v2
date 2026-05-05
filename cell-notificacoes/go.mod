@@ -3,6 +3,7 @@ module github.com/ranselmo/poc-eci/cell-notificacoes
 go 1.22
 
 require (
+	github.com/ranselmo/poc-eci/shared v0.0.0
 	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/google/uuid v1.6.0
@@ -75,3 +76,5 @@ require (
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/ranselmo/poc-eci/shared => ../shared

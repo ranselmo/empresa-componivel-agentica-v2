@@ -11,8 +11,8 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/monitoring"
-	"github.com/ranselmo/poc-eci/cell-estoque/infra/resilience"
+	"github.com/ranselmo/poc-eci/shared/monitoring"
+	"github.com/ranselmo/poc-eci/shared/resilience"
 )
 
 const (

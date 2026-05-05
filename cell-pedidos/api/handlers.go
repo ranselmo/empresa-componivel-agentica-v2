@@ -9,8 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
-	"github.com/ranselmo/poc-eci/cell-pedidos/infra/audit"
-	"github.com/ranselmo/poc-eci/cell-pedidos/infra/auth"
+	"github.com/ranselmo/poc-eci/shared/audit"
+	"github.com/ranselmo/poc-eci/shared/auth"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/db"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/messaging"
 )

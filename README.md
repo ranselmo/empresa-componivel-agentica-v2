@@ -412,6 +412,18 @@ docker compose up -d && ./check.sh --full
 
 ## Changelog
 
+### v2.10.0 — 2026-05-05
+
+**REFINE.md Fase R2 — Módulo `shared/` (elimina 18 pacotes duplicados)**
+
+- **`shared/` criado** como módulo Go independente (`github.com/ranselmo/poc-eci/shared`) com 6 pacotes: `resilience/` (Breaker, Bulkhead, Retry), `auth/` (JWT middleware), `audit/` (Logger Kafka), `cache/` (Redis cache-aside), `middleware/` (RateLimit), `monitoring/` (métricas Prometheus FinOps)
+- **18 pacotes duplicados removidos** de `cell-pedidos/infra/`, `cell-estoque/infra/`, `cell-notificacoes/infra/` — cada um tinha cópia idêntica de todos os 6 pacotes
+- **`replace` directives** adicionadas em cada `go.mod` (`../shared`) para resolução local sem publicação em registry
+- **R4.1 incluído**: `middleware/ratelimit.go` agora limpa entradas idle via goroutine com ticker de 5min, evitando crescimento ilimitado do map de limiters por IP
+- Todos os 6 componentes compilam limpos; todos os checks estáticos passam
+
+---
+
 ### v2.9.0 — 2026-05-04
 
 **REFINE.md Fase R1 — Correção de bugs críticos e segurança**
