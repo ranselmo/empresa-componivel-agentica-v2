@@ -7,6 +7,7 @@ networks:
 volumes:
   grafana-data:
   prometheus-data:
+  kafka-data:
 
 # ── Infraestrutura base ────────────────────────────────────────────────────────
 services:
@@ -16,6 +17,8 @@ services:
     networks: [poc-eci]
     ports:
       - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -75,6 +78,23 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  debezium-init:
+    image: curlimages/curl:8.6.0
+    networks: [poc-eci]
+    depends_on:
+      debezium:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/register-connectors.sh"]
+    volumes:
+      - ./infra/debezium/register-connectors.sh:/scripts/register-connectors.sh:ro
+    restart: on-failure
 
   prometheus:
     image: prom/prometheus:v2.48.0
@@ -99,6 +119,7 @@ services:
       - grafana-data:/var/lib/grafana
       - ./infra/monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
       - ./infra/monitoring/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./infra/monitoring/dashboards:/etc/grafana/provisioning/dashboards/eci:ro
     environment:
       GF_SECURITY_ADMIN_PASSWORD: poc123
       GF_SECURITY_ADMIN_USER: admin
@@ -112,11 +133,33 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
 
+  loki:
+    image: grafana/loki:2.9.0
+    networks: [poc-eci]
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    networks: [poc-eci]
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./infra/monitoring/promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on: [loki]
+
   alertmanager:
     image: prom/alertmanager:v0.26.0
     networks: [poc-eci]
     ports:
       - "9093:9093"
+    volumes:
+      - ./infra/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    environment:
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-http://localhost/webhook-placeholder}
 
   db-saga:
     image: postgres:16-alpine

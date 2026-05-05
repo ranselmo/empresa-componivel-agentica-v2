@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: debezium-init
+  namespace: poc-eci
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-debezium
+          image: curlimages/curl:8.6.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until curl -sf http://debezium:8083/connectors; do
+                echo "waiting for debezium..."; sleep 5
+              done
+      containers:
+        - name: register-connectors
+          image: curlimages/curl:8.6.0
+          env:
+            - name: DEBEZIUM_URL
+              value: http://debezium:8083
+          command: ["/bin/sh", "/scripts/register-connectors.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: debezium-init-scripts
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debezium-init-scripts
+  namespace: poc-eci
+data:
+  register-connectors.sh: |
+    #!/bin/sh
+    # See infra/debezium/register-connectors.sh for the full script.
+    # In production, mount this ConfigMap from the actual script content.
+    DEBEZIUM_URL=${DEBEZIUM_URL:-http://debezium:8083}
+    echo "Connectors registration triggered at $(date)"
+    curl -sf "$DEBEZIUM_URL/connectors"

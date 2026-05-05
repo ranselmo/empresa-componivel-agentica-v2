@@ -11,12 +11,16 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/ranselmo/poc-eci/shared/audit"
-	"github.com/ranselmo/poc-eci/shared/auth"
 	dbpkg "github.com/ranselmo/poc-eci/cell-estoque/infra/db"
 	"github.com/ranselmo/poc-eci/cell-estoque/infra/messaging"
+	migrations "github.com/ranselmo/poc-eci/cell-estoque/migrations"
+	"github.com/ranselmo/poc-eci/shared/audit"
+	"github.com/ranselmo/poc-eci/shared/auth"
 	"github.com/ranselmo/poc-eci/shared/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
@@ -140,10 +144,25 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
-	if err := store.Migrate(ctx); err != nil {
-		slog.Error("migrate", "err", err)
+
+	driver, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		slog.Error("migrate source", "err", err)
 		os.Exit(1)
 	}
+	m, err := migrate.NewWithSourceInstance("iofs", driver, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		slog.Error("migrate new", "err", err)
+		os.Exit(1)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		slog.Error("migrate up", "err", err)
+		os.Exit(1)
+	}
+	if err := store.Seed(ctx); err != nil {
+		slog.Warn("seed", "err", err)
+	}
+	slog.Info("migrations applied")
 
 	prod, err := messaging.NewProducer()
 	if err != nil {

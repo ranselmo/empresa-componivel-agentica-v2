@@ -1,0 +1,22 @@
+# Environment secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# k8s secrets with real values — use secrets-template.yaml as base
+k8s/base/secrets-template-filled.yaml
+
+# Binaries
+cell-pedidos/cell
+cell-estoque/cell
+cell-notificacoes/cell
+shard-router/shard-router
+saga-hub/saga-hub
+data-sync/data-sync
+
+# Build artifacts
+*.test
+*.out
+
+# macOS
+.DS_Store

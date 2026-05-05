@@ -2,17 +2,20 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ranselmo/poc-eci/cell-pedidos/domain"
-	"github.com/ranselmo/poc-eci/shared/audit"
-	"github.com/ranselmo/poc-eci/shared/auth"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/db"
 	"github.com/ranselmo/poc-eci/cell-pedidos/infra/messaging"
+	"github.com/ranselmo/poc-eci/shared/audit"
+	"github.com/ranselmo/poc-eci/shared/auth"
 )
 
 type Handler struct {
@@ -25,7 +28,7 @@ func NewHandler(store *db.Store, prod *messaging.Producer, al *audit.Logger) *Ha
 	return &Handler{store: store, prod: prod, audit: al}
 }
 
-// ProcessCommand implementa messaging.CommandProcessor — recebe comandos do saga-hub via Kafka
+// ProcessCommand implements messaging.CommandProcessor — receives commands from saga-hub via Kafka.
 func (h *Handler) ProcessCommand(ctx context.Context, cmd messaging.Command) (messaging.Reply, error) {
 	switch cmd.CommandType {
 	case "criar_pedido":
@@ -121,11 +124,23 @@ type criarPedidoReq struct {
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	jwtMW := auth.Middleware()
-	g := r.Group("/pedidos")
+	v1 := r.Group("/v1")
+
+	// ── pedidos ──────────────────────────────────────────────────
+	g := v1.Group("/pedidos")
 	g.GET("/", h.ListarPedidos)
 	g.GET("/stats", h.Stats)
 	g.GET("/:id", h.BuscarPedido)
 	g.POST("/", jwtMW, h.CriarPedido)
+
+	// ── GDPR ─────────────────────────────────────────────────────
+	v1.DELETE("/clientes/:cliente_id/dados", jwtMW, h.DeletarDadosCliente)
+
+	// Backward-compat redirects (301) for one deprecation cycle
+	r.GET("/pedidos/", func(c *gin.Context) { c.Redirect(http.StatusMovedPermanently, "/v1"+c.Request.URL.Path) })
+	r.GET("/pedidos/stats", func(c *gin.Context) { c.Redirect(http.StatusMovedPermanently, "/v1/pedidos/stats") })
+	r.GET("/pedidos/:id", func(c *gin.Context) { c.Redirect(http.StatusMovedPermanently, "/v1/pedidos/"+c.Param("id")) })
+	r.POST("/pedidos/", jwtMW, func(c *gin.Context) { c.Redirect(http.StatusMovedPermanently, "/v1/pedidos/") })
 }
 
 func (h *Handler) Stats(c *gin.Context) {
@@ -138,6 +153,21 @@ func (h *Handler) Stats(c *gin.Context) {
 }
 
 func (h *Handler) CriarPedido(c *gin.Context) {
+	// P2.1 — Idempotency-Key
+	idempKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idempKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header required"})
+		return
+	}
+	clientID := c.GetHeader("X-Client-ID")
+	cacheKey := clientID + ":" + idempKey
+
+	if cached, hit, _ := h.store.CheckIdempotency(c.Request.Context(), cacheKey); hit {
+		c.Header("Idempotent-Replayed", "true")
+		c.Data(http.StatusCreated, "application/json", cached)
+		return
+	}
+
 	var req criarPedidoReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
@@ -179,12 +209,17 @@ func (h *Handler) CriarPedido(c *gin.Context) {
 		fmt.Sprintf("%v", actorID),
 		map[string]any{"cliente_id": req.ClienteID, "valor_total": pedido.ValorTotal()})
 
-	c.JSON(http.StatusCreated, gin.H{
+	resp := gin.H{
 		"pedido_id":   pedido.ID,
 		"status":      pedido.Status,
 		"valor_total": pedido.ValorTotal(),
 		"mensagem":    "Pedido criado. Use POST /saga/pedido para o fluxo completo com SAGA.",
-	})
+	}
+	if b, err := json.Marshal(resp); err == nil {
+		_ = h.store.StoreIdempotency(c.Request.Context(), cacheKey, b)
+	}
+
+	c.JSON(http.StatusCreated, resp)
 }
 
 func (h *Handler) BuscarPedido(c *gin.Context) {
@@ -202,16 +237,91 @@ func (h *Handler) BuscarPedido(c *gin.Context) {
 }
 
 func (h *Handler) ListarPedidos(c *gin.Context) {
-	pedidos, err := h.store.Listar(c.Request.Context(), 20)
+	// P2.2 — Cursor-based pagination
+	var after time.Time
+	if afterStr := c.Query("after"); afterStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, afterStr); err == nil {
+			after = t
+		}
+	}
+	limit := 20
+	if lStr := c.Query("limit"); lStr != "" {
+		if n, err := strconv.Atoi(lStr); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	pedidos, err := h.store.Listar(c.Request.Context(), after, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
 	result := make([]any, len(pedidos))
 	for i, p := range pedidos {
 		result[i] = pedidoResp(p)
 	}
-	c.JSON(http.StatusOK, result)
+
+	resp := gin.H{"data": result, "count": len(result)}
+	if len(pedidos) == limit {
+		resp["next_cursor"] = pedidos[len(pedidos)-1].CriadoEm.Format(time.RFC3339Nano)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// DeletarDadosCliente implements GDPR right-to-erasure (DELETE /v1/clientes/:id/dados).
+// Requires role "admin" in JWT.
+func (h *Handler) DeletarDadosCliente(c *gin.Context) {
+	roles, _ := c.Get("roles")
+	if !hasRole(roles, "admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+		return
+	}
+
+	clienteID, err := uuid.Parse(c.Param("cliente_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cliente_id inválido"})
+		return
+	}
+
+	n, err := h.store.DeletarPorCliente(c.Request.Context(), clienteID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "erro ao deletar dados"})
+		return
+	}
+
+	actorID, _ := c.Get("actor_id")
+	if actorID == nil {
+		actorID = "anonymous"
+	}
+	h.audit.Log(c.Request.Context(), "GDPR_DELETE", "cliente", clienteID.String(),
+		fmt.Sprintf("%v", actorID),
+		map[string]any{"registros_deletados": n})
+
+	c.Status(http.StatusNoContent)
+}
+
+func hasRole(roles any, target string) bool {
+	if roles == nil {
+		return false
+	}
+	switch v := roles.(type) {
+	case []string:
+		for _, r := range v {
+			if r == target {
+				return true
+			}
+		}
+	case []any:
+		for _, r := range v {
+			if fmt.Sprintf("%v", r) == target {
+				return true
+			}
+		}
+	case string:
+		return v == target
+	}
+	return false
 }
 
 func pedidoResp(p *domain.Pedido) gin.H {

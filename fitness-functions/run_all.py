@@ -74,11 +74,16 @@ def _expected_post_pedidos() -> int:
         return 201
     return 401
 
+import uuid as _uuid
+
+def _idempotency_headers(base: dict) -> dict:
+    return {**_auth_headers(base), "Idempotency-Key": str(_uuid.uuid4())}
+
 CONTRACTS = [
     {
-        "cell": "pedidos", "method": "POST", "path": "/pedidos/",
-        "name": "POST /pedidos cria com campos obrigatórios",
-        "headers": _auth_headers({"X-Client-ID": "ff2-test-cliente"}),
+        "cell": "pedidos", "method": "POST", "path": "/v1/pedidos/",
+        "name": "POST /v1/pedidos cria com idempotency-key",
+        "headers": _idempotency_headers({"X-Client-ID": "ff2-test-cliente"}),
         "body": {
             "cliente_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
             "itens": [{"produto_id": "22222222-2222-2222-2222-222222222222",
@@ -88,17 +93,24 @@ CONTRACTS = [
         "required_fields": ["pedido_id", "status", "valor_total"] if _expected_post_pedidos() == 201 else [],
     },
     {
-        "cell": "pedidos", "method": "GET", "path": "/pedidos/",
-        "name": "GET /pedidos retorna lista",
+        "cell": "pedidos", "method": "GET", "path": "/v1/pedidos/",
+        "name": "GET /v1/pedidos retorna paginação cursor",
         "headers": {"X-Client-ID": "ff2-test-cliente"},
-        "body": None, "expected_status": 200, "expect_list": True,
+        "body": None, "expected_status": 200,
+        "required_fields": ["data", "count"],
     },
     {
-        "cell": "pedidos", "method": "GET", "path": "/pedidos/stats",
-        "name": "GET /pedidos/stats retorna estatísticas",
+        "cell": "pedidos", "method": "GET", "path": "/v1/pedidos/stats",
+        "name": "GET /v1/pedidos/stats retorna estatísticas",
         "headers": {"X-Client-ID": "ff2-test-cliente"},
         "body": None, "expected_status": 200,
         "required_fields": ["total", "pendentes"],
+    },
+    {
+        "cell": "pedidos", "method": "GET", "path": "/pedidos/",
+        "name": "GET /pedidos/ redirect 301 para /v1",
+        "headers": {"X-Client-ID": "ff2-test-cliente"},
+        "body": None, "expected_status": 301, "no_follow": True,
     },
     {
         "cell": "estoque", "method": "GET", "path": "/estoque/",
@@ -142,12 +154,16 @@ async def run_ff2() -> bool:
     print("FF2 — Contract Tests (via shard-router:8080)")
     print("─" * 55)
     all_ok = True
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=8.0) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=8.0, follow_redirects=True) as client:
         for c in CONTRACTS:
             try:
                 headers = c.get("headers", {})
+                no_follow = c.get("no_follow", False)
                 if c["method"] == "GET":
-                    r = await client.get(c["path"], headers=headers)
+                    if no_follow:
+                        r = await client.get(c["path"], headers=headers, follow_redirects=False)
+                    else:
+                        r = await client.get(c["path"], headers=headers)
                 else:
                     r = await client.post(c["path"], json=c["body"], headers=headers)
 
@@ -187,7 +203,7 @@ async def run_ff3() -> bool:
     print("─" * 55)
 
     endpoints = [
-        ("GET /pedidos/",      f"{BASE_URL}/pedidos/",      {"X-Client-ID": "ff3-load-test"}),
+        ("GET /v1/pedidos/",   f"{BASE_URL}/v1/pedidos/",   {"X-Client-ID": "ff3-load-test"}),
         ("GET /estoque/",      f"{BASE_URL}/estoque/",      {}),
         ("GET /router/cells",  f"{BASE_URL}/router/cells",  {}),
     ]

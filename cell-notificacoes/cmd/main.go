@@ -10,9 +10,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/db"
 	"github.com/ranselmo/poc-eci/cell-notificacoes/infra/messaging"
+	migrations "github.com/ranselmo/poc-eci/cell-notificacoes/migrations"
 	"github.com/ranselmo/poc-eci/shared/audit"
 	"github.com/ranselmo/poc-eci/shared/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -52,6 +56,22 @@ func main() {
 
 	shardID := os.Getenv("SHARD_ID")
 	cellRole := os.Getenv("CELL_ROLE")
+
+	driver, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		slog.Error("migrate source", "err", err)
+		os.Exit(1)
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", driver, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		slog.Error("migrate new", "err", err)
+		os.Exit(1)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		slog.Error("migrate up", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("migrations applied")
 
 	store, err := db.New(ctx)
 	if err != nil {

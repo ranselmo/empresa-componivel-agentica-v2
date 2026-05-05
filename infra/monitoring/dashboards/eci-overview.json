@@ -1,0 +1,187 @@
+{
+  "title": "ECI v2 — Overview",
+  "uid": "eci-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "shard",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(shard_router_requests_total, shard)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "SAGA Throughput (5m)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(saga_completed_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0 },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "success" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "compensated" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "failed" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "title": "SAGA Latency p99",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(saga_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(saga_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 } }
+    },
+    {
+      "id": 3,
+      "title": "Availability by Shard/PBC",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "shard:availability:rate5m * 100",
+          "legendFormat": "{{shard}} {{pbc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100,
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 99 },
+              { "color": "green", "value": 99.9 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Error Budget Burn Rate",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "shard:error_budget_burn",
+          "legendFormat": "{{shard}} {{pbc}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0,
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "CDC Lag (data-sync)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 8, "h": 7 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "data_sync_lag_seconds",
+          "legendFormat": "{{shard}} {{pbc}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 } }
+    },
+    {
+      "id": 6,
+      "title": "Circuit Breakers",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 16, "w": 8, "h": 7 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "circuit_breaker_state",
+          "legendFormat": "{{cell}} {{component}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 2,
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "closed", "color": "green" }, "1": { "text": "half-open", "color": "yellow" }, "2": { "text": "OPEN", "color": "red" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Request Rate by Shard",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 16, "w": 8, "h": 7 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (shard) (rate(shard_router_requests_total[1m]))",
+          "legendFormat": "shard-{{shard}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "min": 0 } }
+    },
+    {
+      "id": 8,
+      "title": "Healthy Cells",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 23, "w": 6, "h": 5 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "count(up{job=~\"cell-.*\"} == 1)",
+          "legendFormat": "healthy"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0, "max": 18,
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 14 },
+              { "color": "green", "value": 16 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

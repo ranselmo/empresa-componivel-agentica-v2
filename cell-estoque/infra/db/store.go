@@ -64,6 +64,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return s.seed(ctx)
 }
 
+func (s *Store) Seed(ctx context.Context) error {
+	return s.seed(ctx)
+}
+
 func (s *Store) seed(ctx context.Context) error {
 	seeds := []struct {
 		id    string

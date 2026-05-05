@@ -132,3 +132,22 @@ jobs:
         with:
           version: v1.59.1
           working-directory: ${{ matrix.cell }}
+
+  integration-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cell: [cell-pedidos, cell-estoque]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ matrix.cell }}-${{ hashFiles(format('{0}/go.sum', matrix.cell)) }}
+          restore-keys: ${{ runner.os }}-go-${{ matrix.cell }}-
+      - name: integration-test (testcontainers)
+        run: cd ${{ matrix.cell }} && go test -tags integration -race -count=1 -timeout 5m ./...

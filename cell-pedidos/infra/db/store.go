@@ -149,10 +149,28 @@ func (s *Store) BuscarPorID(ctx context.Context, id uuid.UUID) (*domain.Pedido, 
 	return p, nil
 }
 
-func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, cliente_id, status, itens, criado_em, atualizado_em
-		 FROM pedidos ORDER BY criado_em DESC LIMIT $1`, limit)
+// Listar returns pedidos with cursor-based pagination.
+// after: timestamp cursor (exclusive); zero time means from the beginning.
+// limit: max results, capped at 100.
+func (s *Store) Listar(ctx context.Context, after time.Time, limit int) ([]*domain.Pedido, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	var query string
+	var args []any
+	if after.IsZero() {
+		query = `SELECT id, cliente_id, status, itens, criado_em, atualizado_em
+				 FROM pedidos ORDER BY criado_em DESC, id DESC LIMIT $1`
+		args = []any{limit}
+	} else {
+		query = `SELECT id, cliente_id, status, itens, criado_em, atualizado_em
+				 FROM pedidos WHERE criado_em < $1
+				 ORDER BY criado_em DESC, id DESC LIMIT $2`
+		args = []any{after, limit}
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +201,36 @@ func (s *Store) Listar(ctx context.Context, limit int) ([]*domain.Pedido, error)
 		})
 	}
 	return pedidos, nil
+}
+
+// DeletarPorCliente removes all pedidos for a cliente_id (GDPR right-to-erasure).
+func (s *Store) DeletarPorCliente(ctx context.Context, clienteID uuid.UUID) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM pedidos WHERE cliente_id = $1`, clienteID)
+	if err != nil {
+		return 0, err
+	}
+	if s.cache != nil {
+		_ = s.cache.Del(ctx, clienteID.String())
+	}
+	return tag.RowsAffected(), nil
+}
+
+// CheckIdempotency returns the cached response bytes for key, or (nil, false, nil) if not found.
+func (s *Store) CheckIdempotency(ctx context.Context, key string) ([]byte, bool, error) {
+	if s.cache == nil {
+		return nil, false, nil
+	}
+	var raw []byte
+	hit, err := s.cache.Get(ctx, "idem:"+key, &raw)
+	return raw, hit, err
+}
+
+// StoreIdempotency caches the response bytes for key.
+func (s *Store) StoreIdempotency(ctx context.Context, key string, response []byte) error {
+	if s.cache == nil {
+		return nil
+	}
+	return s.cache.Set(ctx, "idem:"+key, response)
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }

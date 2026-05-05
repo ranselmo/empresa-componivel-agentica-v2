@@ -27,19 +27,6 @@ func New(ctx context.Context) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS notificacoes (
-			id              UUID PRIMARY KEY,
-			destinatario_id UUID NOT NULL,
-			tipo            TEXT NOT NULL,
-			canal           TEXT NOT NULL,
-			conteudo        TEXT NOT NULL,
-			enviado_em      TIMESTAMPTZ NOT NULL
-		);
-	`)
-	if err != nil {
-		return nil, err
-	}
 
 	shardID := os.Getenv("SHARD_ID")
 	ca, err := cache.New("notificacoes:", cache.TTLFromEnv(5*time.Second))

@@ -10,10 +10,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	sagaapi "github.com/ranselmo/poc-eci/saga-hub/api"
 	"github.com/ranselmo/poc-eci/saga-hub/infra/db"
 	"github.com/ranselmo/poc-eci/saga-hub/infra/messaging"
+	migrations "github.com/ranselmo/poc-eci/saga-hub/migrations"
 	"github.com/ranselmo/poc-eci/saga-hub/orchestrator"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
@@ -47,16 +51,28 @@ func main() {
 	defer cancel()
 	defer setupOTel(ctx, "saga-hub")()
 
+	driver, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		slog.Error("migrate source", "err", err)
+		os.Exit(1)
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", driver, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		slog.Error("migrate new", "err", err)
+		os.Exit(1)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		slog.Error("migrate up", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("migrations applied")
+
 	store, err := db.NewSagaStore(ctx)
 	if err != nil {
 		slog.Error("db", "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
-	if err := store.Migrate(ctx); err != nil {
-		slog.Error("migrate", "err", err)
-		os.Exit(1)
-	}
 
 	prod, err := messaging.NewProducer()
 	if err != nil {
