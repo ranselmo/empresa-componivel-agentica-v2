@@ -1,0 +1,41 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cell-pedidos-ingress
+  namespace: poc-eci
+spec:
+  podSelector:
+    matchLabels: { pbc: pedidos }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: shard-router } }
+        - podSelector: { matchLabels: { app: prometheus } }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cell-estoque-ingress
+  namespace: poc-eci
+spec:
+  podSelector:
+    matchLabels: { pbc: estoque }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: shard-router } }
+        - podSelector: { matchLabels: { app: prometheus } }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cell-notificacoes-ingress
+  namespace: poc-eci
+spec:
+  podSelector:
+    matchLabels: { pbc: notificacoes }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: shard-router } }
+        - podSelector: { matchLabels: { app: prometheus } }

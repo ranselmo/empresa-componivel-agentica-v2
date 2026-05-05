@@ -3,7 +3,8 @@ Agente MCP — Pilar 4: Célula Inteligente
 Stack: Python + Anthropic SDK (SDK nativo para agentes de IA)
 Células Go são acessadas via HTTP — agnóstico à linguagem.
 """
-import asyncio, os, json, logging, subprocess, httpx
+import asyncio, os, json, logging, httpx
+from collections import deque
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -18,10 +19,18 @@ CELL_ESTOQUE_URL      = os.getenv("CELL_ESTOQUE_URL",      "http://cell-estoque:
 CELL_NOTIFICACOES_URL = os.getenv("CELL_NOTIFICACOES_URL", "http://cell-notificacoes:8000")
 PROMETHEUS_URL        = os.getenv("PROMETHEUS_URL",        "http://prometheus:9090")
 ANTHROPIC_API_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL       = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 SHARD_ROUTER_URL      = os.getenv("SHARD_ROUTER_URL",     "http://shard-router:8080")
 SAGA_HUB_URL          = os.getenv("SAGA_HUB_URL",         "http://saga-hub:9090")
 
 client_ai = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+ALLOWED_CONTAINERS = {
+    "cell-pedidos-s1-active", "cell-pedidos-s2-active", "cell-pedidos-s3-active",
+    "cell-estoque-s1-active", "cell-estoque-s2-active", "cell-estoque-s3-active",
+    "cell-notif-s1-active", "cell-notif-s2-active", "cell-notif-s3-active",
+    "shard-router", "saga-hub", "data-sync",
+}
 
 # F5.1 — Shard-aware tools
 SHARD_TOOLS = [
@@ -89,12 +98,20 @@ async def executar_shard_tool(name: str, inputs: dict) -> str:
                 r = await http.post(f"{SAGA_HUB_URL}/saga/pedido", json=inputs)
                 return json.dumps(r.json(), ensure_ascii=False)
             elif name == "reiniciar_celula":
-                result = subprocess.run(
-                    ["docker", "restart", inputs["container_name"]],
-                    capture_output=True, text=True, timeout=30
+                container = inputs["container_name"]
+                if container not in ALLOWED_CONTAINERS:
+                    return json.dumps({"error": f"container '{container}' not in allowlist"})
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "restart", container,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                return json.dumps({"stdout": result.stdout, "stderr": result.stderr,
-                                   "returncode": result.returncode})
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                return json.dumps({
+                    "stdout": stdout.decode(),
+                    "stderr": stderr.decode(),
+                    "returncode": proc.returncode,
+                })
             elif name == "consultar_prometheus":
                 r = await http.get(f"{PROMETHEUS_URL}/api/v1/query",
                     params={"query": inputs["query"]})
@@ -248,7 +265,7 @@ Responda em português brasileiro. Seja direto e objetivo."""
 
     for _ in range(10):
         response = await client_ai.messages.create(
-            model="claude-sonnet-4-6",
+            model=ANTHROPIC_MODEL,
             max_tokens=2048,
             system=system,
             tools=ALL_TOOLS,
@@ -273,7 +290,7 @@ Responda em português brasileiro. Seja direto e objetivo."""
     return "Agente atingiu limite de iterações."
 
 
-monitor_log: list[dict] = []
+monitor_log: deque[dict] = deque(maxlen=100)
 
 
 async def loop_monitoramento():
@@ -328,8 +345,6 @@ async def loop_monitoramento():
                 entrada_log["resultado"] = resultado
 
             monitor_log.append(entrada_log)
-            if len(monitor_log) > 100:
-                monitor_log.pop(0)
 
         except Exception as e:
             logger.error(f"Erro no monitoramento: {e}")

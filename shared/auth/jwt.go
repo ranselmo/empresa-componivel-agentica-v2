@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 func Middleware() gin.HandlerFunc {
 	jwksURL := os.Getenv("JWKS_URL")
 	if jwksURL == "" {
+		slog.Warn("JWKS_URL not set — JWT authentication disabled (dev mode only)")
 		return func(c *gin.Context) { c.Next() }
 	}
 

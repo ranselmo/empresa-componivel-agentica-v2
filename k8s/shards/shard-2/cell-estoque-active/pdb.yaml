@@ -1,0 +1,9 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cell-estoque-s2-active-pdb
+  namespace: poc-eci
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: cell-estoque, shard: shard-2, role: active }

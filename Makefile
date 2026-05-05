@@ -1,7 +1,9 @@
 # Makefile — PoC ECI v2 (Go + Kafka)
 # Facilita o gerenciamento das células Go localmente
 
-.PHONY: help deps build up down logs test ff clean
+VERSION ?= $(shell git describe --tags --always --dirty)
+
+.PHONY: help deps build build-images push-images up down logs test ff clean
 
 help: ## Mostra esta ajuda
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -56,6 +58,19 @@ kafka-lag: ## Mostra o consumer lag de todos os grupos
 	docker compose exec kafka kafka-consumer-groups \
 		--bootstrap-server kafka:29092 \
 		--describe --all-groups 2>/dev/null || echo "Nenhum grupo ativo ainda"
+
+build-images: ## Build Docker images com tag versionada (VERSION=$(git describe))
+	docker build -t poc-eci/shard-router:$(VERSION)      ./shard-router
+	docker build -t poc-eci/saga-hub:$(VERSION)          ./saga-hub
+	docker build -t poc-eci/data-sync:$(VERSION)         ./data-sync
+	docker build -t poc-eci/cell-pedidos:$(VERSION)      ./cell-pedidos
+	docker build -t poc-eci/cell-estoque:$(VERSION)      ./cell-estoque
+	docker build -t poc-eci/cell-notificacoes:$(VERSION) ./cell-notificacoes
+	docker build -t poc-eci/agent-mcp:$(VERSION)         ./agent-mcp
+
+push-images: ## Push das imagens versionadas para o registry
+	$(foreach c,shard-router saga-hub data-sync cell-pedidos cell-estoque cell-notificacoes agent-mcp,\
+		docker push poc-eci/$(c):$(VERSION);)
 
 clean: ## Remove binários e caches
 	find . -name "*.test" -delete
